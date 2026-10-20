@@ -196,8 +196,17 @@ int main(int argc, char *argv[])
     uint32_t frame_buffer[GUEST_SCREEN_WIDTH * GUEST_SCREEN_HEIGHT];
     memset(frame_buffer, 0, sizeof frame_buffer);
 
-    printf("\n>>> Drag and drop an iPhone OS 3.1.3 IPSW file into this window to start! <<<\n");
-    printf("Hotkeys: Esc=Home, F1=Power, F2/F3=Vol-/+, F5=Mute, F11=Fullscreen, Space=Pause\n\n");
+    char fw_json[512] = {0};
+    engine_firmware_json(g_engine, fw_json, sizeof fw_json);
+    bool fw_ready = (strstr(fw_json, "\"complete\":true") != NULL);
+    if (fw_ready) {
+        printf("\n=== iPhone OS 3.1.3 is running! ===\n");
+        printf("Controls: Mouse/Click = Touchscreen, Esc = Home, F1 = Power, F2/F3 = Vol -/+, F5 = Mute, F11 = Fullscreen, Space = Pause\n");
+        printf("Note: If the screen is black or asleep, press Esc (Home) or F1 (Power) to wake up the screen.\n\n");
+    } else {
+        printf("\n>>> Drag and drop an iPhone OS 3.1.3 IPSW file into this window to install firmware! <<<\n");
+        printf("Hotkeys: Esc=Home, F1=Power, F2/F3=Vol-/+, F5=Mute, F11=Fullscreen, Space=Pause\n\n");
+    }
 
     bool running = true;
     bool fullscreen = false;

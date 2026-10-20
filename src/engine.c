@@ -852,6 +852,8 @@ static void engine_user_svc_observer(void *ctx, struct arm_cpu *cpu, uint32_t pc
 
 /* ---------------------------------------------------------- persistence --- */
 
+static void join_worker(engine_t *e);
+
 static bool persist_instances_locked(engine_t *e)
 {
     size_t need = vm_instance_serialize(&e->instances, NULL, 0);
@@ -1023,6 +1025,7 @@ static int engine_import_ipsw_fd(engine_t *engine, int fd, uint64_t size,
                                                 "No IPSW was provided.");
         return -1;
     }
+    join_worker(e);
     pthread_mutex_lock(&e->lock);
     if (e->phase != PHASE_IDLE) {
         pthread_mutex_unlock(&e->lock);
