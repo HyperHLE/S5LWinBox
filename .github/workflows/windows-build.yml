@@ -1,0 +1,72 @@
+name: Build S5LWinBox (Windows x64)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Package Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build HyperHLE GLES Core
+        run: |
+          cd rust/hyperhle-gles
+          cargo build --release
+          cd ../..
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build S5LWinBox
+        run: |
+          cmake --build build --config Release --target s5lwinbox --parallel
+
+      - name: Assemble Release Package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+          New-Item -ItemType Directory -Path package -Force
+          
+          Copy-Item build/Release/s5lwinbox.exe package/ -Force
+          Copy-Item build/Release/SDL2.dll package/ -Force -ErrorAction SilentlyContinue
+          Copy-Item rust/hyperhle-gles/target/release/hyperhle_gles.dll package/ -Force -ErrorAction SilentlyContinue
+          Copy-Item README.md package/ -Force -ErrorAction SilentlyContinue
+          Copy-Item LICENSE package/ -Force -ErrorAction SilentlyContinue
+          
+          Compress-Archive -Path package/* -DestinationPath dist/S5LWinBox-windows-x64.zip -Force
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: S5LWinBox-windows-x64
+          path: dist/S5LWinBox-windows-x64.zip
+          retention-days: 14
+
+      - name: Notify Telegram
+        if: always()
+        shell: powershell
+        env:
+          BUILD_STATUS: ${{ job.status }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          python tools/notify_telegram.py

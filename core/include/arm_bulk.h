@@ -1,0 +1,53 @@
+/* Bounded native execution of witnessed A32 routines and Thumb loops. */
+#ifndef S5LBOX_ARM_BULK_H
+#define S5LBOX_ARM_BULK_H
+
+#include "arm.h"
+#include "arm_ram_watch.h"
+#include <stddef.h>
+
+/* Derived, bounded data summaries; never executable or serialized. Every hit
+ * re-proves current READ mappings and unchanged load bytes, using an optional
+ * owned write witness or exact comparisons. No old host pointer is followed.
+ * An owned witness also admits a bounded compact-descriptor index for longer
+ * traversals; allocation failure retains the smaller byte-validated cache.
+ * Adjacent witnessed ordered/filtered spans can compose within one read-only
+ * invocation, preserving all dependencies and original instruction budgets. */
+typedef struct arm_bulk_cache arm_bulk_cache_t;
+arm_bulk_cache_t *arm_bulk_cache_create(void);
+void arm_bulk_cache_destroy(arm_bulk_cache_t *cache);
+void arm_bulk_cache_reset(arm_bulk_cache_t *cache);
+uint64_t arm_bulk_cache_hits(const arm_bulk_cache_t *cache);
+
+typedef struct {
+    /* The caller owns a live FETCH witness for this complete code span. */
+    const uint8_t *code;
+    uint32_t code_base;
+    uint32_t code_bytes;
+    /* Flat RAM is a harness-only alternative to existing DREAD witnesses. */
+    const uint8_t *flat_ram;
+    size_t flat_size;
+    bool data_cache;
+    /* Read-only loops can resolve cold READ pages with the shared MMU decoder
+     * only when both descriptors and data fit this immutable RAM capability.
+     * Cached mappings/faults still take precedence. No bus access or cache
+     * publication is allowed while speculating about an entire iteration. */
+    const arm_ram_window_t *ram_window;
+    arm_bulk_cache_t *cache;
+    /* Optional, fully owned write-consent witness. NULL retains exact byte
+     * validation. Reset the cache before changing this object's lifetime. */
+    arm_ram_watch_t *watch;
+} arm_bulk_memory_t;
+
+/* Returns the exact number of original instructions represented, bounded by
+ * budget. The caller owns cycle/device accounting. Zero changes no architectural
+ * CPU state, cache counters or guest bytes. Capturing a write witness can revoke
+ * derived DWRITE grants. No bus access, MMIO or executable write occurs.
+ * Matching proves the witnessed instruction pattern and complete admitted
+ * control flow, never a name or assumed PC.
+ * A long loop may return an exact prefix at its header for bounded resumption.
+ * Ordinary execution enables this only through an explicit host-policy gate. */
+unsigned arm_bulk_string_try(arm_cpu_t *cpu, const arm_bulk_memory_t *memory,
+                             unsigned budget);
+
+#endif

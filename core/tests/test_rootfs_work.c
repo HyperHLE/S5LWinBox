@@ -1,0 +1,1897 @@
+/*
+ * S5LBox -- bounded external rootfs work-image provisioner tests.
+ *
+ * Fixtures are intentionally tiny bare HFSX volumes (8 KiB before growth),
+ * and every path is relative to the F:-backed test working directory.
+ *
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+ */
+#ifdef _WIN32
+/* Guarded: core/CMakeLists.txt now defines this for the whole directory, and an
+ * unguarded redefinition is C4005, which /WX makes an error. */
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#else
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include "rootfs_work.h"
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+#define FIXTURE_BLOCK_SIZE 512u
+#define FIXTURE_BLOCKS 16u
+#define FIXTURE_SIZE (FIXTURE_BLOCK_SIZE * FIXTURE_BLOCKS)
+#define FIXTURE_BITMAP_OFFSET (4u * FIXTURE_BLOCK_SIZE)
+#define FIXTURE_FSTAB_OFFSET 4090u
+#define HFS_VH_OFF 1024u
+#define HFS_VH_LEN 512u
+
+static const uint8_t FSTAB_STOCK[] =
+    "/dev/disk0s1 / hfs ro 0 1\n"
+    "/dev/disk0s2 /private/var hfs rw,nosuid,nodev 0 2\n";
+
+/*
+ * Stock /System/Library/LaunchDaemons/com.apple.SpringBoard.plist, iPhone OS
+ * 3.1.3 (7E18): 1490 bytes.  Held here independently of the provisioner's own
+ * copy so the fixtures assert what the transformation must match rather than
+ * agreeing with it by construction.
+ */
+static const uint8_t CA_PLIST_STOCK[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    "<plist version=\"1.0\">\n"
+    "<dict>\n"
+    "\t<key>KeepAlive</key>\n"
+    "\t<true/>\n"
+    "\t<key>Label</key>\n"
+    "\t<string>com.apple.SpringBoard</string>\n"
+    "\t<key>MachServices</key>\n"
+    "\t<dict>\n"
+    "\t\t<key>com.apple.springboard.watchdogserver</key>\n"
+    "\t\t<true/>\n"
+    "\t\t<key>com.apple.SBUserNotification</key>\n"
+    "\t\t<true/>\n"
+    "\t\t<key>PurpleSystemEventPort</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t\t<key>com.apple.CARenderServer</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t\t<key>com.apple.iohideventsystem</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t\t<key>com.apple.springboard</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t\t<key>com.apple.springboard.UIKit.migserver</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t\t<key>com.apple.springboard.services</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t\t<key>com.apple.springboard.remotenotifications</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t\t<key>com.apple.smsserver</key>\n"
+    "\t\t<dict>\n"
+    "\t\t\t<key>ResetAtClose</key>\n"
+    "\t\t\t<true/>\n"
+    "\t\t</dict>\n"
+    "\t</dict>\n"
+    "\t<key>ProgramArguments</key>\n"
+    "\t<array>\n"
+    "\t\t<string>/System/Library/CoreServices/SpringBoard.app/SpringBoard</string>\n"
+    "\t</array>\n"
+    "\t<key>UserName</key>\n"
+    "\t<string>mobile</string>\n"
+    "\t<key>ThrottleInterval</key>\n"
+    "\t<integer>5</integer>\n"
+    "\t<key>EmbeddedPrivilegeDispensation</key>\n"
+    "\t<true/>\n"
+    "</dict>\n"
+    "</plist>\n";
+
+#define CA_PLIST_SIZE (sizeof(CA_PLIST_STOCK) - 1u)
+/*
+ * Two 1490-byte copies inside the 8 KiB fixture, both clear of the reserved
+ * head (blocks 0..2), the allocation file (block 4), the stock fstab record at
+ * 4090, and the reserved tail (blocks 14..15).
+ */
+#define FIXTURE_PLIST_OFFSET 2570u
+#define FIXTURE_PLIST_OFFSET_SECOND 4200u
+
+/*
+ * /System/Library/LaunchDaemons/com.apple.chud.pilotfish.plist, stock iPhone
+ * OS 3.1.3 (7E18), 530 bytes.  Held here independently of the provisioner's
+ * own copy for the same reason the SpringBoard plist is: these bytes are the
+ * assertion, and a test that included the header's constant would agree with
+ * the transformation by construction rather than check it.
+ *
+ * Transcribed byte-for-byte, mixed indentation and all -- the file really does
+ * use eight spaces almost everywhere and four tabs on the <true/> line, and
+ * its DOCTYPE really does say "Apple Inc." where the SpringBoard plist's says
+ * "Apple".  Normalising either would break the pattern match against a real
+ * image, which is exactly the failure this copy exists to catch.
+ */
+static const uint8_t PPP_PLIST_STOCK[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE plist PUBLIC \"-//Apple Inc.//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    "<plist version=\"1.0\">\n"
+    "<dict>\n"
+    "        <key>Label</key>\n"
+    "        <string>com.apple.chud.pilotfish</string>\n"
+    "        <key>MachServices</key>\n"
+    "        <dict>\n"
+    "                <key>com.apple.chud.pilotfish</key>\n"
+    "\t\t\t\t<true/>\n"
+    "        </dict>\n"
+    "        <key>ProgramArguments</key>\n"
+    "        <array>\n"
+    "                <string>/Developer/usr/libexec/pilotfish</string>\n"
+    "        </array>\n"
+    "</dict>\n"
+    "</plist>\n";
+
+#define PPP_PLIST_SIZE (sizeof(PPP_PLIST_STOCK) - 1u)
+/*
+ * Two 530-byte copies, both inside blocks 5..13 (2560..7167) and therefore
+ * clear of the reserved head, the allocation file, the stock fstab record at
+ * 4090, the reserved tail, and both SpringBoard plist windows.
+ */
+#define FIXTURE_PPP_OFFSET 6000u
+#define FIXTURE_PPP_OFFSET_SECOND 6600u
+
+/* Independently fixed SHA-256 of make_hfs_fixture(..., 1). */
+static const uint8_t FIXTURE_SHA256[IOS3_SHA256_DIGEST_SIZE] = {
+    0xa2u, 0x95u, 0x22u, 0x37u, 0x9bu, 0x5eu, 0xf1u, 0x8fu,
+    0x60u, 0x79u, 0x24u, 0x54u, 0x3au, 0xb6u, 0x14u, 0xb9u,
+    0x87u, 0x32u, 0x31u, 0xb0u, 0x58u, 0x1bu, 0xbfu, 0x95u,
+    0xf5u, 0xc7u, 0xa1u, 0x49u, 0x6au, 0xcfu, 0x5du, 0x47u
+};
+
+static const uint8_t SHA256_EMPTY[IOS3_SHA256_DIGEST_SIZE] = {
+    0xe3u, 0xb0u, 0xc4u, 0x42u, 0x98u, 0xfcu, 0x1cu, 0x14u,
+    0x9au, 0xfbu, 0xf4u, 0xc8u, 0x99u, 0x6fu, 0xb9u, 0x24u,
+    0x27u, 0xaeu, 0x41u, 0xe4u, 0x64u, 0x9bu, 0x93u, 0x4cu,
+    0xa4u, 0x95u, 0x99u, 0x1bu, 0x78u, 0x52u, 0xb8u, 0x55u
+};
+
+static const uint8_t SHA256_ABC[IOS3_SHA256_DIGEST_SIZE] = {
+    0xbau, 0x78u, 0x16u, 0xbfu, 0x8fu, 0x01u, 0xcfu, 0xeau,
+    0x41u, 0x41u, 0x40u, 0xdeu, 0x5du, 0xaeu, 0x22u, 0x23u,
+    0xb0u, 0x03u, 0x61u, 0xa3u, 0x96u, 0x17u, 0x7au, 0x9cu,
+    0xb4u, 0x10u, 0xffu, 0x61u, 0xf2u, 0x00u, 0x15u, 0xadu
+};
+
+static const uint8_t SHA256_LONG[IOS3_SHA256_DIGEST_SIZE] = {
+    0x24u, 0x8du, 0x6au, 0x61u, 0xd2u, 0x06u, 0x38u, 0xb8u,
+    0xe5u, 0xc0u, 0x26u, 0x93u, 0x0cu, 0x3eu, 0x60u, 0x39u,
+    0xa3u, 0x3cu, 0xe4u, 0x59u, 0x64u, 0xffu, 0x21u, 0x67u,
+    0xf6u, 0xecu, 0xedu, 0xd4u, 0x19u, 0xdbu, 0x06u, 0xc1u
+};
+
+static int g_pass;
+static int g_fail;
+static unsigned g_serial;
+
+#define CHECK(condition, ...) do {                                           \
+    if (condition) {                                                         \
+        g_pass++;                                                            \
+    } else {                                                                \
+        g_fail++;                                                            \
+        printf("  FAIL %s:%d: ", __func__, __LINE__);                       \
+        printf(__VA_ARGS__);                                                 \
+        printf("\n");                                                       \
+    }                                                                        \
+} while (0)
+
+static unsigned long process_id(void) {
+#ifdef _WIN32
+    return (unsigned long)_getpid();
+#else
+    return (unsigned long)getpid();
+#endif
+}
+
+static bool make_path(char *path, size_t capacity, const char *tag) {
+    int length;
+
+    g_serial++;
+    length = snprintf(path, capacity, "rootfs_work_%lu_%u_%s.img",
+                      process_id(), g_serial, tag);
+    return length > 0 && (size_t)length < capacity;
+}
+
+static void put_be16(uint8_t *bytes, uint16_t value) {
+    bytes[0] = (uint8_t)(value >> 8);
+    bytes[1] = (uint8_t)value;
+}
+
+static void put_be32(uint8_t *bytes, uint32_t value) {
+    bytes[0] = (uint8_t)(value >> 24);
+    bytes[1] = (uint8_t)(value >> 16);
+    bytes[2] = (uint8_t)(value >> 8);
+    bytes[3] = (uint8_t)value;
+}
+
+static void put_be64(uint8_t *bytes, uint64_t value) {
+    put_be32(bytes, (uint32_t)(value >> 32));
+    put_be32(bytes + 4, (uint32_t)value);
+}
+
+static uint32_t get_be32(const uint8_t *bytes) {
+    return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+           ((uint32_t)bytes[2] << 8) | bytes[3];
+}
+
+static uint64_t get_be64(const uint8_t *bytes) {
+    return ((uint64_t)get_be32(bytes) << 32) | get_be32(bytes + 4);
+}
+
+static void bitmap_set(uint8_t *image, uint32_t bit, bool set) {
+    uint8_t *byte = image + FIXTURE_BITMAP_OFFSET + (bit >> 3);
+    uint8_t mask = (uint8_t)(1u << (7u - (bit & 7u)));
+
+    *byte = set ? (uint8_t)(*byte | mask) :
+                  (uint8_t)(*byte & (uint8_t)~mask);
+}
+
+static void make_hfs_fixture(uint8_t image[FIXTURE_SIZE], unsigned fstab_count) {
+    uint8_t *header;
+    unsigned index;
+    /* First 1536 bytes, allocation file, and final 1024 bytes are reserved. */
+    const uint32_t used[] = {0u, 1u, 2u, 4u, 14u, 15u};
+
+    memset(image, 0, FIXTURE_SIZE);
+    header = image + HFS_VH_OFF;
+    put_be16(header, 0x4858u);             /* HFSX */
+    put_be16(header + 2, 5u);
+    put_be32(header + 4, 1u << 8);         /* cleanly unmounted */
+    put_be32(header + 12, 0u);
+    put_be32(header + 40, FIXTURE_BLOCK_SIZE);
+    put_be32(header + 44, FIXTURE_BLOCKS);
+    put_be32(header + 48, FIXTURE_BLOCKS -
+                                 (uint32_t)(sizeof(used) / sizeof(used[0])));
+    put_be32(header + 52, 1u);
+    put_be64(header + 112, 8u);            /* 64 bitmap bits */
+    put_be32(header + 124, 1u);            /* one allocation-file block */
+    put_be32(header + 128, 4u);            /* extent start */
+    put_be32(header + 132, 1u);            /* extent count */
+    for (index = 0; index < sizeof(used) / sizeof(used[0]); index++)
+        bitmap_set(image, used[index], true);
+    if (fstab_count >= 1u)
+        memcpy(image + FIXTURE_FSTAB_OFFSET, FSTAB_STOCK,
+               sizeof(FSTAB_STOCK) - 1u);
+    if (fstab_count >= 2u)
+        memcpy(image + 5200u, FSTAB_STOCK, sizeof(FSTAB_STOCK) - 1u);
+    memcpy(image + FIXTURE_SIZE - HFS_VH_OFF, header, HFS_VH_LEN);
+}
+
+/*
+ * The stock SpringBoard launchd plist, `count` times, on top of the ordinary
+ * single-fstab fixture: the plist rewrite runs after the fstab rewrite, so a
+ * fixture that reaches it must still carry exactly one stock fstab record.
+ */
+static void make_plist_fixture(uint8_t image[FIXTURE_SIZE], unsigned count) {
+    make_hfs_fixture(image, 1u);
+    if (count >= 1u)
+        memcpy(image + FIXTURE_PLIST_OFFSET, CA_PLIST_STOCK, CA_PLIST_SIZE);
+    if (count >= 2u)
+        memcpy(image + FIXTURE_PLIST_OFFSET_SECOND, CA_PLIST_STOCK,
+               CA_PLIST_SIZE);
+}
+
+/*
+ * The stock chud.pilotfish launchd plist, `count` times, layered the same way
+ * and for the same reason: the PPP rewrite runs after the fstab rewrite, so a
+ * fixture that reaches it must still carry exactly one stock fstab record.
+ *
+ * Layered on top of make_hfs_fixture rather than folded into it, because
+ * FIXTURE_SHA256 is the pinned digest of make_hfs_fixture(..., 1) and every
+ * identity test in this file would have to be re-derived if that changed.
+ */
+static void make_ppp_fixture(uint8_t image[FIXTURE_SIZE], unsigned count) {
+    make_hfs_fixture(image, 1u);
+    if (count >= 1u)
+        memcpy(image + FIXTURE_PPP_OFFSET, PPP_PLIST_STOCK, PPP_PLIST_SIZE);
+    if (count >= 2u)
+        memcpy(image + FIXTURE_PPP_OFFSET_SECOND, PPP_PLIST_STOCK,
+               PPP_PLIST_SIZE);
+}
+
+static bool region_contains(const uint8_t *region, size_t region_size,
+                            const char *needle) {
+    size_t needle_size = strlen(needle);
+    size_t index;
+
+    for (index = 0; index + needle_size <= region_size; index++)
+        if (memcmp(region + index, needle, needle_size) == 0)
+            return true;
+    return false;
+}
+
+static bool write_file(const char *path, const uint8_t *bytes, size_t size) {
+    FILE *stream = fopen(path, "wb");
+    bool okay = stream != NULL;
+
+    if (okay && size != 0u && fwrite(bytes, 1u, size, stream) != size)
+        okay = false;
+    if (stream && fclose(stream) != 0)
+        okay = false;
+    return okay;
+}
+
+static bool read_file(const char *path, uint8_t *bytes, size_t size) {
+    FILE *stream = fopen(path, "rb");
+    bool okay = stream != NULL;
+
+    if (okay && size != 0u && fread(bytes, 1u, size, stream) != size)
+        okay = false;
+    if (stream && fclose(stream) != 0)
+        okay = false;
+    return okay;
+}
+
+static uint64_t file_size(const char *path) {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &info))
+        return UINT64_MAX;
+    return ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+#else
+    struct stat info;
+    if (stat(path, &info) != 0 || info.st_size < 0)
+        return UINT64_MAX;
+    return (uint64_t)info.st_size;
+#endif
+}
+
+static bool path_exists(const char *path) {
+#ifdef _WIN32
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat info;
+    return lstat(path, &info) == 0;
+#endif
+}
+
+static void remove_if_present(const char *path) {
+    if (path)
+        (void)remove(path);
+}
+
+static void require_fixture_identity(rootfs_work_options_t *options) {
+    options->source_identity.required = true;
+    options->source_identity.expected_size = FIXTURE_SIZE;
+    memcpy(options->source_identity.expected_sha256, FIXTURE_SHA256,
+           sizeof(FIXTURE_SHA256));
+}
+
+static void test_sha256_known_answers_and_chunking(void) {
+    static const uint8_t abc[] = {'a', 'b', 'c'};
+    static const uint8_t long_message[] =
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    ios3_sha256_context_t context;
+    uint8_t digest[IOS3_SHA256_DIGEST_SIZE];
+    uint8_t in_place[IOS3_SHA256_DIGEST_SIZE];
+    size_t index;
+
+    CHECK(ios3_sha256(NULL, 0u, digest) &&
+          memcmp(digest, SHA256_EMPTY, sizeof(digest)) == 0,
+          "empty SHA-256 known-answer test failed");
+    CHECK(ios3_sha256(abc, sizeof(abc), digest) &&
+          memcmp(digest, SHA256_ABC, sizeof(digest)) == 0,
+          "abc SHA-256 known-answer test failed");
+    memset(in_place, 0, sizeof(in_place));
+    memcpy(in_place, abc, sizeof(abc));
+    CHECK(ios3_sha256(in_place, sizeof(abc), in_place) &&
+          memcmp(in_place, SHA256_ABC, sizeof(in_place)) == 0,
+          "one-shot SHA-256 did not support exact in-place output overlap");
+    CHECK(ios3_sha256(long_message, sizeof(long_message) - 1u, digest) &&
+          memcmp(digest, SHA256_LONG, sizeof(digest)) == 0,
+          "long SHA-256 known-answer test failed");
+
+    CHECK(ios3_sha256_init(&context), "chunked SHA-256 init failed");
+    for (index = 0u; index < sizeof(long_message) - 1u; index++)
+        CHECK(ios3_sha256_update(&context, long_message + index, 1u),
+              "one-byte SHA-256 update %zu failed", index);
+    CHECK(ios3_sha256_final(&context, digest) &&
+          memcmp(digest, SHA256_LONG, sizeof(digest)) == 0,
+          "one-byte chunked SHA-256 differs from the KAT");
+}
+
+static void test_sha256_invalid_and_overflow_guards(void) {
+    ios3_sha256_context_t context;
+    ios3_sha256_context_t before;
+    uint8_t digest[IOS3_SHA256_DIGEST_SIZE];
+    uint8_t byte = 0x5au;
+
+    CHECK(!ios3_sha256_init(NULL), "NULL SHA-256 context was initialized");
+    CHECK(!ios3_sha256(NULL, 1u, digest),
+          "NULL non-empty one-shot input was accepted");
+    CHECK(!ios3_sha256(&byte, 1u, NULL),
+          "NULL one-shot digest was accepted");
+#if SIZE_MAX > (UINT64_MAX / UINT64_C(8))
+    CHECK(!ios3_sha256(&byte, SIZE_MAX, digest),
+          "oversized one-shot SHA-256 input was accepted");
+#endif
+
+    CHECK(ios3_sha256_init(&context), "invalid-case init failed");
+    before = context;
+    CHECK(!ios3_sha256_update(&context, NULL, 1u) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "invalid non-empty update mutated the SHA-256 context");
+    CHECK(ios3_sha256_update(&context, NULL, 0u) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "zero-length update was not a no-op");
+    CHECK(!ios3_sha256_final(&context, NULL) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "invalid final mutated the SHA-256 context");
+
+    context.total_bytes = IOS3_SHA256_MAX_INPUT_BYTES;
+    before = context;
+    CHECK(!ios3_sha256_update(&context, &byte, 1u) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "cumulative SHA-256 overflow mutated the context");
+    context.total_bytes = IOS3_SHA256_MAX_INPUT_BYTES - UINT64_C(1);
+    before = context;
+    CHECK(!ios3_sha256_update(&context, digest, 2u) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "multi-byte SHA-256 overflow mutated the context");
+    context.total_bytes = IOS3_SHA256_MAX_INPUT_BYTES + UINT64_C(1);
+    before = context;
+    CHECK(!ios3_sha256_update(&context, NULL, 0u) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "already-overflowed SHA-256 context was accepted");
+
+    CHECK(ios3_sha256_init(&context) &&
+          ios3_sha256_update(&context, &byte, 1u) &&
+          ios3_sha256_final(&context, digest),
+          "finalization setup failed");
+    before = context;
+    CHECK(!ios3_sha256_update(&context, &byte, 1u) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "post-final update mutated the SHA-256 context");
+    CHECK(!ios3_sha256_final(&context, digest) &&
+          memcmp(&context, &before, sizeof(context)) == 0,
+          "second final mutated the SHA-256 context");
+}
+
+static bool no_temporary_files(void) {
+    unsigned attempt;
+
+    for (attempt = 0; attempt < 128u; attempt++) {
+        char path[100];
+        int length = snprintf(path, sizeof(path),
+                              ".rootfs-work-%lu-%u.tmp",
+                              process_id(), attempt);
+        if (length <= 0 || (size_t)length >= sizeof(path) || path_exists(path))
+            return false;
+    }
+    return true;
+}
+
+static void test_success_boundary_growth_and_source_immutable(void) {
+    char source[160];
+    char destination[160];
+    uint8_t original[FIXTURE_SIZE];
+    uint8_t source_after[FIXTURE_SIZE];
+    uint8_t header[HFS_VH_LEN];
+    uint8_t alternate[HFS_VH_LEN];
+    uint8_t replacement[sizeof(FSTAB_STOCK) - 1u];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    rootfs_work_status_t status;
+    FILE *stream;
+    uint64_t expected_size = (uint64_t)19u * FIXTURE_BLOCK_SIZE;
+
+    CHECK(make_path(source, sizeof(source), "source"),
+          "could not form source path");
+    CHECK(make_path(destination, sizeof(destination), "work"),
+          "could not form destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_hfs_fixture(original, 1u);
+    CHECK(write_file(source, original, sizeof(original)),
+          "could not write valid fixture");
+    memset(&options, 0, sizeof(options));
+    options.fstab_line = "/dev/md0 / hfs rw,update 0 0";
+    options.growth_bytes = 4u * FIXTURE_BLOCK_SIZE;
+    options.io_buffer_bytes = 1u; /* worst-case copy/hash/scan boundaries */
+    require_fixture_identity(&options);
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK,
+          "create failed: %s/%s sys=%d detail=%s",
+          rootfs_work_status_name(status), rootfs_work_stage_name(result.stage),
+          result.system_error, result.detail);
+    CHECK(result.published && !result.temporary_left,
+          "success did not report one clean publication");
+    CHECK(result.source_sha256_valid && result.source_identity_verified &&
+          memcmp(result.source_sha256, FIXTURE_SHA256,
+                 sizeof(FIXTURE_SHA256)) == 0,
+          "successful exact source identity was not reported");
+    CHECK(result.source_size == FIXTURE_SIZE &&
+          result.bytes_copied == FIXTURE_SIZE,
+          "copy accounting was %llu/%llu",
+          (unsigned long long)result.source_size,
+          (unsigned long long)result.bytes_copied);
+    CHECK(result.final_size == expected_size &&
+          file_size(destination) == expected_size,
+          "grown size was %llu (disk %llu), expected %llu",
+          (unsigned long long)result.final_size,
+          (unsigned long long)file_size(destination),
+          (unsigned long long)expected_size);
+    CHECK(result.io_buffer_bytes == 1u &&
+          result.io_buffer_bytes <= ROOTFS_WORK_MAX_IO_BUFFER,
+          "bounded I/O buffer accounting was %zu", result.io_buffer_bytes);
+    CHECK(result.fstab_offset == FIXTURE_FSTAB_OFFSET,
+          "boundary-spanning fstab hit was 0x%llx",
+          (unsigned long long)result.fstab_offset);
+    CHECK(read_file(source, source_after, sizeof(source_after)) &&
+          memcmp(original, source_after, sizeof(original)) == 0,
+          "immutable source changed during provisioning");
+
+    stream = fopen(destination, "rb");
+    CHECK(stream != NULL, "could not open published work image");
+    if (stream) {
+        CHECK(fseek(stream, (long)HFS_VH_OFF, SEEK_SET) == 0 &&
+              fread(header, 1u, sizeof(header), stream) == sizeof(header),
+              "could not read grown primary header");
+        CHECK(fseek(stream, (long)(expected_size - HFS_VH_OFF), SEEK_SET) == 0 &&
+              fread(alternate, 1u, sizeof(alternate), stream) ==
+                  sizeof(alternate),
+              "could not read grown alternate header");
+        CHECK(fseek(stream, (long)FIXTURE_FSTAB_OFFSET, SEEK_SET) == 0 &&
+              fread(replacement, 1u, sizeof(replacement), stream) ==
+                  sizeof(replacement),
+              "could not read rewritten fstab");
+        CHECK(fclose(stream) == 0, "could not close published work image");
+        CHECK(get_be32(header + 44) == 19u,
+              "grown totalBlocks was %u", get_be32(header + 44));
+        CHECK(get_be32(header + 48) == 13u,
+              "grown freeBlocks was %u", get_be32(header + 48));
+        CHECK(get_be32(header + 52) == 14u,
+              "grown nextAllocation was %u", get_be32(header + 52));
+        CHECK(memcmp(header, alternate, sizeof(header)) == 0,
+              "grown alternate header differs from primary");
+        CHECK(memcmp(replacement, options.fstab_line,
+                     strlen(options.fstab_line)) == 0 &&
+              replacement[strlen(options.fstab_line)] == '\n' &&
+              replacement[sizeof(replacement) - 1u] == '\n',
+              "fstab replacement/padding is malformed");
+    }
+    CHECK(no_temporary_files(), "successful publication left a temp name");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void test_minimum_volume_expands_allocation_file(void) {
+    enum { TARGET_BLOCKS = 4097u };
+    char source[160];
+    char destination[160];
+    uint8_t original[FIXTURE_SIZE];
+    uint8_t source_after[FIXTURE_SIZE];
+    uint8_t header[HFS_VH_LEN];
+    uint8_t alternate[HFS_VH_LEN];
+    uint8_t old_tail_bits[2];
+    uint8_t high_tail_low = 0u;
+    uint8_t high_tail_high = 0u;
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    rootfs_work_status_t status;
+    FILE *stream;
+    const uint64_t expected_size =
+        (uint64_t)TARGET_BLOCKS * FIXTURE_BLOCK_SIZE;
+
+    CHECK(make_path(source, sizeof(source), "bitmap-grow-source"),
+          "could not form bitmap-growth source path");
+    CHECK(make_path(destination, sizeof(destination), "bitmap-grow-work"),
+          "could not form bitmap-growth destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_hfs_fixture(original, 1u);
+    CHECK(write_file(source, original, sizeof(original)),
+          "could not write bitmap-growth fixture");
+    memset(&options, 0, sizeof(options));
+    options.preserve_fstab = true;
+    options.minimum_volume_bytes = expected_size;
+    options.io_buffer_bytes = 7u;
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK,
+          "bitmap growth failed: %s/%s sys=%d detail=%s",
+          rootfs_work_status_name(status), rootfs_work_stage_name(result.stage),
+          result.system_error, result.detail);
+    CHECK(result.published && result.final_size == expected_size &&
+          file_size(destination) == expected_size,
+          "bitmap-grown image was %llu/%llu bytes, expected %llu",
+          (unsigned long long)result.final_size,
+          (unsigned long long)file_size(destination),
+          (unsigned long long)expected_size);
+    CHECK(read_file(source, source_after, sizeof(source_after)) &&
+          memcmp(original, source_after, sizeof(original)) == 0,
+          "bitmap growth changed the immutable source");
+
+    stream = fopen(destination, "rb");
+    CHECK(stream != NULL, "could not open bitmap-grown image");
+    if (stream) {
+        CHECK(fseek(stream, (long)HFS_VH_OFF, SEEK_SET) == 0 &&
+              fread(header, 1u, sizeof(header), stream) == sizeof(header),
+              "could not read bitmap-grown primary header");
+        CHECK(fseek(stream, (long)(expected_size - HFS_VH_OFF), SEEK_SET) == 0 &&
+              fread(alternate, 1u, sizeof(alternate), stream) ==
+                  sizeof(alternate),
+              "could not read bitmap-grown alternate header");
+        CHECK(fseek(stream, (long)(FIXTURE_BITMAP_OFFSET + 1u), SEEK_SET) == 0 &&
+              fread(old_tail_bits, 1u, sizeof(old_tail_bits), stream) ==
+                  sizeof(old_tail_bits),
+              "could not read the low allocation bits");
+        CHECK(fseek(stream,
+                    (long)(FIXTURE_BITMAP_OFFSET + FIXTURE_BLOCK_SIZE - 1u),
+                    SEEK_SET) == 0 &&
+              fread(&high_tail_low, 1u, 1u, stream) == 1u &&
+              fseek(stream, (long)(FIXTURE_BLOCKS * FIXTURE_BLOCK_SIZE),
+                    SEEK_SET) == 0 &&
+              fread(&high_tail_high, 1u, 1u, stream) == 1u,
+              "could not read the split expanded-allocation bits");
+        CHECK(fclose(stream) == 0,
+              "could not close bitmap-grown work image");
+
+        CHECK(get_be32(header + 44u) == TARGET_BLOCKS &&
+              get_be32(header + 48u) == TARGET_BLOCKS - 7u &&
+              get_be32(header + 52u) == 14u,
+              "bitmap-grown volume accounting is %u/%u/%u",
+              get_be32(header + 44u), get_be32(header + 48u),
+              get_be32(header + 52u));
+        CHECK(get_be64(header + 112u) == 513u &&
+              get_be32(header + 124u) == 2u &&
+              get_be32(header + 128u) == 4u &&
+              get_be32(header + 132u) == 1u &&
+              get_be32(header + 136u) == FIXTURE_BLOCKS &&
+              get_be32(header + 140u) == 1u,
+              "allocation fork was not extended into one new inline extent");
+        CHECK(memcmp(header, alternate, sizeof(header)) == 0,
+              "bitmap-grown alternate header differs from primary");
+        CHECK(old_tail_bits[0] == 0u && old_tail_bits[1] == 0x80u,
+              "old tail was not freed or the new bitmap block was not owned: "
+              "%02x %02x", old_tail_bits[0], old_tail_bits[1]);
+        CHECK(high_tail_low == 0x01u && high_tail_high == 0x80u,
+              "new alternate-header bits are not split across bitmap extents: "
+              "%02x %02x", high_tail_low, high_tail_high);
+    }
+    CHECK(no_temporary_files(),
+          "bitmap-growth success left a temporary name");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void test_stale_alternate_accounting_is_accepted(void) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    uint8_t source_after[FIXTURE_SIZE];
+    uint8_t primary[HFS_VH_LEN];
+    uint8_t alternate[HFS_VH_LEN];
+    uint8_t *stale;
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    FILE *stream;
+    uint64_t expected_size = (uint64_t)19u * FIXTURE_BLOCK_SIZE;
+
+    CHECK(make_path(source, sizeof(source), "stale-accounting-source"),
+          "could not form stale-accounting source path");
+    CHECK(make_path(destination, sizeof(destination), "stale-accounting-work"),
+          "could not form stale-accounting destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_hfs_fixture(fixture, 1u);
+    stale = fixture + FIXTURE_SIZE - HFS_VH_OFF;
+    put_be32(stale + 20u, 0x12345678u); /* modifyDate */
+    put_be32(stale + 32u, 3u);          /* fileCount */
+    put_be32(stale + 36u, 2u);          /* folderCount */
+    put_be32(stale + 48u, 9u);          /* freeBlocks */
+    put_be32(stale + 52u, 2u);          /* nextAllocation */
+    put_be32(stale + 64u, 15u);         /* nextCatalogID */
+    put_be32(stale + 68u, 7u);          /* writeCount */
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write stale-accounting fixture");
+
+    memset(&options, 0, sizeof(options));
+    options.fstab_line = "/dev/md0 / hfs rw,update 0 0";
+    options.growth_bytes = 4u * FIXTURE_BLOCK_SIZE;
+    options.io_buffer_bytes = 17u;
+    CHECK(rootfs_work_create(source, destination, &options, &result) ==
+              ROOTFS_WORK_OK,
+          "legal stale alternate returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(result.published && file_size(destination) == expected_size,
+          "legal stale alternate did not publish the grown work image");
+    CHECK(read_file(source, source_after, sizeof(source_after)) &&
+              memcmp(source_after, fixture, sizeof(fixture)) == 0,
+          "stale-accounting source changed during provisioning");
+
+    stream = fopen(destination, "rb");
+    CHECK(stream != NULL, "could not open stale-accounting work image");
+    if (stream) {
+        CHECK(fseek(stream, (long)HFS_VH_OFF, SEEK_SET) == 0 &&
+                  fread(primary, 1u, sizeof(primary), stream) ==
+                      sizeof(primary),
+              "could not read stale-accounting primary header");
+        CHECK(fseek(stream, (long)(expected_size - HFS_VH_OFF), SEEK_SET) == 0 &&
+                  fread(alternate, 1u, sizeof(alternate), stream) ==
+                      sizeof(alternate),
+              "could not read stale-accounting alternate header");
+        CHECK(fclose(stream) == 0,
+              "could not close stale-accounting work image");
+        CHECK(memcmp(primary, alternate, sizeof(primary)) == 0,
+              "published work image did not refresh its alternate header");
+    }
+    CHECK(no_temporary_files(),
+          "stale-accounting success left a temporary file");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void test_required_identity_chunk_boundaries(void) {
+    static const size_t buffer_sizes[] = {1u, 63u, 64u, 65u};
+    char source[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    size_t index;
+
+    CHECK(make_path(source, sizeof(source), "identity-boundary-source"),
+          "could not form identity-boundary source path");
+    remove_if_present(source);
+    make_hfs_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write identity-boundary fixture");
+
+    for (index = 0u; index < sizeof(buffer_sizes) / sizeof(buffer_sizes[0]);
+         index++) {
+        char destination[160];
+        rootfs_work_options_t options;
+        rootfs_work_result_t result;
+        rootfs_work_status_t status;
+
+        CHECK(make_path(destination, sizeof(destination),
+                        "identity-boundary-work"),
+              "could not form identity-boundary destination %zu", index);
+        remove_if_present(destination);
+        memset(&options, 0, sizeof(options));
+        require_fixture_identity(&options);
+        options.io_buffer_bytes = buffer_sizes[index];
+        status = rootfs_work_create(source, destination, &options, &result);
+        CHECK(status == ROOTFS_WORK_OK,
+              "required identity with %zu-byte chunks returned %s/%s: %s",
+              buffer_sizes[index], rootfs_work_status_name(status),
+              rootfs_work_stage_name(result.stage), result.detail);
+        CHECK(result.published && result.source_sha256_valid &&
+                  result.source_identity_verified &&
+                  result.io_buffer_bytes == buffer_sizes[index] &&
+                  memcmp(result.source_sha256, FIXTURE_SHA256,
+                         sizeof(FIXTURE_SHA256)) == 0,
+              "required identity with %zu-byte chunks reported wrong proof",
+              buffer_sizes[index]);
+        CHECK(path_exists(destination) &&
+                  file_size(destination) == FIXTURE_SIZE &&
+                  !result.temporary_left && no_temporary_files(),
+              "required identity with %zu-byte chunks did not publish cleanly",
+              buffer_sizes[index]);
+        remove_if_present(destination);
+    }
+
+    remove_if_present(source);
+}
+
+static void test_source_identity_policy_and_cleanup(void) {
+    char source[160];
+    char wrong_size_destination[160];
+    char wrong_hash_destination[160];
+    char disabled_destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), "identity-source"),
+          "could not form identity source path");
+    CHECK(make_path(wrong_size_destination,
+                    sizeof(wrong_size_destination), "wrong-size"),
+          "could not form wrong-size destination path");
+    CHECK(make_path(wrong_hash_destination,
+                    sizeof(wrong_hash_destination), "wrong-hash"),
+          "could not form wrong-hash destination path");
+    CHECK(make_path(disabled_destination,
+                    sizeof(disabled_destination), "identity-disabled"),
+          "could not form disabled-policy destination path");
+    remove_if_present(source);
+    remove_if_present(wrong_size_destination);
+    remove_if_present(wrong_hash_destination);
+    remove_if_present(disabled_destination);
+    make_hfs_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write identity fixture");
+
+    memset(&options, 0, sizeof(options));
+    require_fixture_identity(&options);
+    options.source_identity.expected_size = FIXTURE_SIZE + UINT64_C(1);
+    options.io_buffer_bytes = 63u;
+    CHECK(rootfs_work_create(source, wrong_size_destination,
+                             &options, &result) ==
+              ROOTFS_WORK_SOURCE_IDENTITY_MISMATCH &&
+          result.stage == ROOTFS_WORK_STAGE_SOURCE_IDENTITY,
+          "wrong source size returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(result.bytes_copied == 0u && !result.source_sha256_valid &&
+          !result.source_identity_verified && !result.published,
+          "wrong-size refusal reported copy/hash/publication progress");
+    CHECK(!path_exists(wrong_size_destination) && no_temporary_files(),
+          "wrong-size identity refusal left an output artifact");
+
+    memset(&options, 0, sizeof(options));
+    require_fixture_identity(&options);
+    options.source_identity.expected_sha256[31] ^= 1u;
+    options.io_buffer_bytes = 64u;
+    CHECK(rootfs_work_create(source, wrong_hash_destination,
+                             &options, &result) ==
+              ROOTFS_WORK_SOURCE_IDENTITY_MISMATCH &&
+          result.stage == ROOTFS_WORK_STAGE_SOURCE_IDENTITY,
+          "wrong source digest returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(result.bytes_copied == FIXTURE_SIZE &&
+          result.source_sha256_valid &&
+          !result.source_identity_verified && !result.published &&
+          memcmp(result.source_sha256, FIXTURE_SHA256,
+                 sizeof(FIXTURE_SHA256)) == 0,
+          "wrong-hash refusal flags or observed digest are incorrect");
+    CHECK(!path_exists(wrong_hash_destination) && no_temporary_files(),
+          "wrong-hash identity refusal left an output artifact");
+
+    memset(&options, 0, sizeof(options));
+    options.source_identity.required = false;
+    options.source_identity.expected_size = UINT64_MAX;
+    memset(options.source_identity.expected_sha256, 0x5a,
+           sizeof(options.source_identity.expected_sha256));
+    options.io_buffer_bytes = 65u;
+    CHECK(rootfs_work_create(source, disabled_destination,
+                             &options, &result) == ROOTFS_WORK_OK,
+          "disabled identity policy returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(result.published && result.source_sha256_valid &&
+          !result.source_identity_verified &&
+          memcmp(result.source_sha256, FIXTURE_SHA256,
+                 sizeof(FIXTURE_SHA256)) == 0,
+          "disabled identity policy did not report digest-only semantics");
+    CHECK(path_exists(disabled_destination) && no_temporary_files(),
+          "disabled identity policy publication state is wrong");
+
+    remove_if_present(disabled_destination);
+    remove_if_present(wrong_hash_destination);
+    remove_if_present(wrong_size_destination);
+    remove_if_present(source);
+}
+
+static void expect_fstab_failure(unsigned count,
+                                 rootfs_work_status_t expected_status,
+                                 const char *tag) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), tag), "could not form source path");
+    CHECK(make_path(destination, sizeof(destination), "rejected"),
+          "could not form destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_hfs_fixture(fixture, count);
+    CHECK(write_file(source, fixture, FIXTURE_SIZE),
+          "could not write fstab fixture");
+    memset(&options, 0, sizeof(options));
+    options.io_buffer_bytes = 19u;
+    CHECK(rootfs_work_create(source, destination, &options, &result) ==
+              expected_status,
+          "fstab count %u returned %s at %s: %s", count,
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(!result.published && !path_exists(destination),
+          "rejected fstab fixture published a destination");
+    CHECK(no_temporary_files(),
+          "rejected fstab fixture left an unpublished temp");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void test_fstab_uniqueness_and_cleanup(void) {
+    expect_fstab_failure(0u, ROOTFS_WORK_FSTAB_NOT_UNIQUE, "absent");
+    expect_fstab_failure(2u, ROOTFS_WORK_FSTAB_NOT_UNIQUE, "duplicate");
+}
+
+/* Everything the rewrite did not deliberately touch must be byte-identical:
+ * the plist record it replaced and the fstab record are the only two windows
+ * where the published image is allowed to differ from its source. */
+static void expect_only_records_changed(const uint8_t *published,
+                                        const uint8_t *fixture,
+                                        const char *tag) {
+    size_t index;
+    size_t differences = 0;
+
+    for (index = 0; index < FIXTURE_SIZE; index++) {
+        bool in_plist = index >= FIXTURE_PLIST_OFFSET &&
+                        index < FIXTURE_PLIST_OFFSET + CA_PLIST_SIZE;
+        bool in_fstab = index >= FIXTURE_FSTAB_OFFSET &&
+                        index < FIXTURE_FSTAB_OFFSET +
+                                (sizeof(FSTAB_STOCK) - 1u);
+        if (!in_plist && !in_fstab && published[index] != fixture[index])
+            differences++;
+    }
+    CHECK(differences == 0u,
+          "%s rewrite changed %zu bytes outside the two rewritten records",
+          tag, differences);
+}
+
+static void expect_ca_plist_refusal(const uint8_t *fixture, const char *tag) {
+    char source[160];
+    char destination[160];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), tag),
+          "could not form %s plist source path", tag);
+    CHECK(make_path(destination, sizeof(destination), "ca-plist-rejected"),
+          "could not form %s plist destination path", tag);
+    remove_if_present(source);
+    remove_if_present(destination);
+    CHECK(write_file(source, fixture, FIXTURE_SIZE),
+          "could not write %s plist fixture", tag);
+    memset(&options, 0, sizeof(options));
+    options.ca_software_render = true;
+    options.io_buffer_bytes = 37u; /* pattern spans many chunk boundaries */
+    CHECK(rootfs_work_create(source, destination, &options, &result) ==
+              ROOTFS_WORK_CA_PLIST_NOT_UNIQUE &&
+          result.stage == ROOTFS_WORK_STAGE_CA_PLIST_SCAN,
+          "%s plist fixture returned %s/%s: %s", tag,
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(result.ca_plist_offset == UINT64_MAX && !result.published,
+          "%s plist refusal reported a rewrite or a publication", tag);
+    CHECK(!path_exists(destination) && no_temporary_files(),
+          "%s plist refusal left an output artifact", tag);
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void test_ca_software_render_plist(void) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    uint8_t published[FIXTURE_SIZE];
+    uint8_t rewritten[CA_PLIST_SIZE];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    rootfs_work_status_t status;
+
+    CHECK(CA_PLIST_SIZE == 1490u,
+          "stock SpringBoard plist fixture is %zu bytes, expected 1490",
+          (size_t)CA_PLIST_SIZE);
+
+    /* One stock record and the flag on: rewritten in place, same length. */
+    CHECK(make_path(source, sizeof(source), "ca-plist-source"),
+          "could not form plist source path");
+    CHECK(make_path(destination, sizeof(destination), "ca-plist-work"),
+          "could not form plist destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_plist_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write software-render plist fixture");
+    memset(&options, 0, sizeof(options));
+    options.ca_software_render = true;
+    options.io_buffer_bytes = 7u; /* 1490-byte pattern, 7-byte chunks */
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK && result.published,
+          "software-render rewrite returned %s/%s: %s",
+          rootfs_work_status_name(status), rootfs_work_stage_name(result.stage),
+          result.detail);
+    CHECK(result.ca_plist_offset == FIXTURE_PLIST_OFFSET,
+          "software-render rewrite reported offset 0x%llx, expected 0x%x",
+          (unsigned long long)result.ca_plist_offset, FIXTURE_PLIST_OFFSET);
+    CHECK(result.final_size == FIXTURE_SIZE &&
+          file_size(destination) == FIXTURE_SIZE,
+          "software-render rewrite changed the image size to %llu",
+          (unsigned long long)file_size(destination));
+    CHECK(read_file(destination, published, sizeof(published)),
+          "could not read the rewritten work image");
+    memcpy(rewritten, published + FIXTURE_PLIST_OFFSET, CA_PLIST_SIZE);
+    CHECK(memcmp(rewritten, CA_PLIST_STOCK, CA_PLIST_SIZE) != 0,
+          "software-render rewrite left the stock plist in place");
+    CHECK(region_contains(rewritten, CA_PLIST_SIZE,
+                          "<key>EnvironmentVariables</key>") &&
+          region_contains(rewritten, CA_PLIST_SIZE,
+                          "<key>CA_ENABLE_MBX2D</key>") &&
+          region_contains(rewritten, CA_PLIST_SIZE, "<string>0</string>"),
+          "rewritten plist does not export CA_ENABLE_MBX2D=0");
+    CHECK(memcmp(rewritten, "<?xml", 5u) == 0 &&
+          memcmp(rewritten + CA_PLIST_SIZE - 9u, "</plist>\n", 9u) == 0,
+          "rewritten plist is not a well-formed <?xml ... </plist> document");
+    expect_only_records_changed(published, fixture, "software-render");
+    CHECK(no_temporary_files(), "software-render rewrite left a temp name");
+    remove_if_present(destination);
+    remove_if_present(source);
+
+    /* Same fixture, flag off: the stock record survives untouched. */
+    CHECK(make_path(destination, sizeof(destination), "ca-plist-disabled"),
+          "could not form disabled-plist destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write disabled-flag plist fixture");
+    memset(&options, 0, sizeof(options));
+    options.ca_software_render = false;
+    options.io_buffer_bytes = 37u;
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK && result.published,
+          "disabled software-render returned %s/%s: %s",
+          rootfs_work_status_name(status), rootfs_work_stage_name(result.stage),
+          result.detail);
+    CHECK(result.ca_plist_offset == UINT64_MAX,
+          "disabled software-render reported a rewrite at 0x%llx",
+          (unsigned long long)result.ca_plist_offset);
+    CHECK(read_file(destination, published, sizeof(published)) &&
+          memcmp(published + FIXTURE_PLIST_OFFSET, CA_PLIST_STOCK,
+                 CA_PLIST_SIZE) == 0,
+          "disabled software-render still modified the SpringBoard plist");
+    remove_if_present(destination);
+    remove_if_present(source);
+
+    /* Ambiguous, absent, and already-rewritten images are all refused. */
+    make_plist_fixture(fixture, 2u);
+    expect_ca_plist_refusal(fixture, "ca-plist-duplicate");
+    make_plist_fixture(fixture, 0u);
+    expect_ca_plist_refusal(fixture, "ca-plist-absent");
+    make_plist_fixture(fixture, 1u);
+    memcpy(fixture + FIXTURE_PLIST_OFFSET, rewritten, CA_PLIST_SIZE);
+    expect_ca_plist_refusal(fixture, "ca-plist-already-rewritten");
+}
+
+/*
+ * The PPP job's blast radius. Kept separate from expect_only_records_changed
+ * rather than folded into it: widening that function to tolerate a third
+ * window would weaken the SpringBoard test by exactly the size of this one,
+ * and these two rewrites are meant to be independently provable.
+ */
+static void expect_only_ppp_and_fstab_changed(const uint8_t *published,
+                                              const uint8_t *fixture,
+                                              const char *tag) {
+    size_t index;
+    size_t differences = 0;
+
+    for (index = 0; index < FIXTURE_SIZE; index++) {
+        bool in_ppp = index >= FIXTURE_PPP_OFFSET &&
+                      index < FIXTURE_PPP_OFFSET + PPP_PLIST_SIZE;
+        bool in_fstab = index >= FIXTURE_FSTAB_OFFSET &&
+                        index < FIXTURE_FSTAB_OFFSET +
+                                (sizeof(FSTAB_STOCK) - 1u);
+        if (!in_ppp && !in_fstab && published[index] != fixture[index])
+            differences++;
+    }
+    CHECK(differences == 0u,
+          "%s rewrite changed %zu bytes outside the two rewritten records",
+          tag, differences);
+}
+
+static void expect_ppp_plist_refusal(const uint8_t *fixture, const char *tag) {
+    char source[160];
+    char destination[160];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), tag),
+          "could not form %s ppp source path", tag);
+    CHECK(make_path(destination, sizeof(destination), "ppp-plist-rejected"),
+          "could not form %s ppp destination path", tag);
+    remove_if_present(source);
+    remove_if_present(destination);
+    CHECK(write_file(source, fixture, FIXTURE_SIZE),
+          "could not write %s ppp fixture", tag);
+    memset(&options, 0, sizeof(options));
+    options.ppp_launchd_job = true;
+    options.io_buffer_bytes = 37u; /* pattern spans many chunk boundaries */
+    CHECK(rootfs_work_create(source, destination, &options, &result) ==
+              ROOTFS_WORK_PPP_PLIST_NOT_UNIQUE &&
+          result.stage == ROOTFS_WORK_STAGE_PPP_PLIST_SCAN,
+          "%s ppp fixture returned %s/%s: %s", tag,
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(result.ppp_plist_offset == UINT64_MAX && !result.published,
+          "%s ppp refusal reported a rewrite or a publication", tag);
+    CHECK(!path_exists(destination) && no_temporary_files(),
+          "%s ppp refusal left an output artifact", tag);
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+/*
+ * The guest half of docs/networking.md's Route D: an inert LaunchDaemon plist
+ * becomes a job that runs the guest's own /usr/sbin/pppd against uart4.
+ *
+ * The property under test is not "some bytes changed". It is that the change
+ * is invisible to HFS+: the record is located by content, must occur exactly
+ * once, and is overwritten by exactly as many bytes, so no catalog field --
+ * not logicalSize, not totalBlocks, not the file's single extent -- has to
+ * move. The image size assertion and the blast-radius assertion together are
+ * what make that checkable rather than asserted.
+ */
+static void test_ppp_launchd_job_plist(void) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    uint8_t published[FIXTURE_SIZE];
+    uint8_t rewritten[PPP_PLIST_SIZE];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    rootfs_work_status_t status;
+
+    /* The budget, stated as a test rather than as a comment. 530 is what
+     * makes chud.pilotfish the only one of the four inert candidates that can
+     * hold a fully-argumented job; the next largest is 515. */
+    CHECK(PPP_PLIST_SIZE == 530u,
+          "stock chud.pilotfish fixture is %zu bytes, expected 530",
+          (size_t)PPP_PLIST_SIZE);
+
+    /* One stock record and the flag on: rewritten in place, same length. */
+    CHECK(make_path(source, sizeof(source), "ppp-plist-source"),
+          "could not form ppp source path");
+    CHECK(make_path(destination, sizeof(destination), "ppp-plist-work"),
+          "could not form ppp destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_ppp_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write ppp job fixture");
+    memset(&options, 0, sizeof(options));
+    options.ppp_launchd_job = true;
+    options.io_buffer_bytes = 7u; /* 530-byte pattern, 7-byte chunks */
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK && result.published,
+          "ppp job rewrite returned %s/%s: %s",
+          rootfs_work_status_name(status), rootfs_work_stage_name(result.stage),
+          result.detail);
+    CHECK(result.ppp_plist_offset == FIXTURE_PPP_OFFSET,
+          "ppp job rewrite reported offset 0x%llx, expected 0x%x",
+          (unsigned long long)result.ppp_plist_offset, FIXTURE_PPP_OFFSET);
+    CHECK(result.final_size == FIXTURE_SIZE &&
+          file_size(destination) == FIXTURE_SIZE,
+          "ppp job rewrite changed the image size to %llu",
+          (unsigned long long)file_size(destination));
+    CHECK(read_file(destination, published, sizeof(published)),
+          "could not read the rewritten work image");
+    memcpy(rewritten, published + FIXTURE_PPP_OFFSET, PPP_PLIST_SIZE);
+    CHECK(memcmp(rewritten, PPP_PLIST_STOCK, PPP_PLIST_SIZE) != 0,
+          "ppp job rewrite left the stock plist in place");
+
+    /* Every argument, checked individually. A job missing `nodetach` runs
+     * once and is declared dead by launchd; one missing `local` blocks
+     * forever waiting for a carrier this UART cannot raise; one missing the
+     * device name does not open a port at all. None of those would be
+     * distinguishable from "the guest never ran pppd" in a boot log. */
+    CHECK(region_contains(rewritten, PPP_PLIST_SIZE,
+                          "<string>/usr/sbin/pppd</string>"),
+          "rewritten job does not run /usr/sbin/pppd");
+    CHECK(region_contains(rewritten, PPP_PLIST_SIZE,
+                          "<string>/dev/tty.debug</string>"),
+          "rewritten job does not name uart4's tty node");
+    /* The console log path, which run74 is the reason for: pppd exited 1 --
+     * its EXIT_FATAL_ERROR -- and launchd sends the job's output to /dev/null
+     * unless a key says otherwise. Without it a run reports an exit code and
+     * nothing else, which is exactly the state run74 was read in.
+     *
+     * It must be StandardOUTPath, and this assertion exists to keep it that
+     * way. run75 spent a whole boot on StandardErrorPath and came back with a
+     * console byte-identical to run74's, because pppd does not use fd 2:
+     * error() and fatal() share one emitter at 0x0002245c which syslog()s and
+     * then writes to *log_to_fd, and _log_to_fd at 0x00039c70 has a file image
+     * of 1. `nodetach` means nothing ever lowers it. Naming the wrong stream
+     * is not a smaller mistake than omitting the key -- it costs the same run
+     * and produces the same silence. */
+    CHECK(region_contains(rewritten, PPP_PLIST_SIZE,
+                          "<key>StandardOutPath</key>") &&
+          region_contains(rewritten, PPP_PLIST_SIZE,
+                          "<string>/dev/console</string>"),
+          "rewritten job discards pppd's own error messages");
+    CHECK(!region_contains(rewritten, PPP_PLIST_SIZE,
+                           "<key>StandardErrorPath</key>"),
+          "rewritten job points at fd 2, which pppd never writes to");
+    CHECK(region_contains(rewritten, PPP_PLIST_SIZE, "<string>local</string>"),
+          "rewritten job lets pppd wait for a carrier this UART has no DCD "
+          "to raise");
+    CHECK(region_contains(rewritten, PPP_PLIST_SIZE,
+                          "<string>nocrtscts</string>"),
+          "rewritten job asks for hardware flow control on a no-flow-control "
+          "port");
+    CHECK(region_contains(rewritten, PPP_PLIST_SIZE,
+                          "<string>nodetach</string>"),
+          "rewritten job lets pppd daemonise, which launchd reads as a death");
+    CHECK(region_contains(rewritten, PPP_PLIST_SIZE, "<key>RunAtLoad</key>"),
+          "rewritten job is not RunAtLoad, so nothing ever starts it");
+
+    /* And the negative: the binary that does not exist must be gone. A job
+     * that still pointed at /Developer would be launched, fail to exec, and
+     * look exactly like a job that was never installed. */
+    CHECK(!region_contains(rewritten, PPP_PLIST_SIZE, "/Developer"),
+          "rewritten job still points at the absent pilotfish binary");
+    CHECK(!region_contains(rewritten, PPP_PLIST_SIZE, "MachServices"),
+          "rewritten job still registers a Mach service for a missing binary");
+
+    CHECK(memcmp(rewritten, "<?xml", 5u) == 0 &&
+          memcmp(rewritten + PPP_PLIST_SIZE - 9u, "</plist>\n", 9u) == 0,
+          "rewritten job is not a well-formed <?xml ... </plist> document");
+    expect_only_ppp_and_fstab_changed(published, fixture, "ppp-job");
+    CHECK(no_temporary_files(), "ppp job rewrite left a temp name");
+    remove_if_present(destination);
+    remove_if_present(source);
+
+    /* Same fixture, flag off: the stock record survives untouched. This is
+     * what keeps a default run a stock run. */
+    CHECK(make_path(destination, sizeof(destination), "ppp-plist-disabled"),
+          "could not form disabled-ppp destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write disabled-flag ppp fixture");
+    memset(&options, 0, sizeof(options));
+    options.ppp_launchd_job = false;
+    options.io_buffer_bytes = 37u;
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK && result.published,
+          "disabled ppp job returned %s/%s: %s",
+          rootfs_work_status_name(status), rootfs_work_stage_name(result.stage),
+          result.detail);
+    CHECK(result.ppp_plist_offset == UINT64_MAX,
+          "disabled ppp job reported a rewrite at 0x%llx",
+          (unsigned long long)result.ppp_plist_offset);
+    CHECK(read_file(destination, published, sizeof(published)) &&
+          memcmp(published + FIXTURE_PPP_OFFSET, PPP_PLIST_STOCK,
+                 PPP_PLIST_SIZE) == 0,
+          "disabled ppp job still modified the pilotfish plist");
+    remove_if_present(destination);
+    remove_if_present(source);
+
+    /* Ambiguous, absent, and already-rewritten images are all refused. The
+     * already-rewritten case is the one that matters operationally: this
+     * transformation runs once against a freshly copied work image, and
+     * re-running it against its own output must fail loudly rather than
+     * appear to succeed. */
+    make_ppp_fixture(fixture, 2u);
+    expect_ppp_plist_refusal(fixture, "ppp-plist-duplicate");
+    make_ppp_fixture(fixture, 0u);
+    expect_ppp_plist_refusal(fixture, "ppp-plist-absent");
+    make_ppp_fixture(fixture, 1u);
+    memcpy(fixture + FIXTURE_PPP_OFFSET, rewritten, PPP_PLIST_SIZE);
+    expect_ppp_plist_refusal(fixture, "ppp-plist-already-rewritten");
+}
+
+/*
+ * Both plist rewrites in one build, which is the realistic invocation: a run
+ * that wants guest networking also wants SpringBoard to render. They touch
+ * disjoint records and run in a fixed order, and neither may disturb the
+ * other's pattern before it has been matched.
+ */
+static void test_both_plist_rewrites_in_one_build(void) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    uint8_t published[FIXTURE_SIZE];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    rootfs_work_status_t status;
+
+    CHECK(make_path(source, sizeof(source), "both-plist-source"),
+          "could not form both-plist source path");
+    CHECK(make_path(destination, sizeof(destination), "both-plist-work"),
+          "could not form both-plist destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+
+    /* One of each, in the same image, alongside the single stock fstab. */
+    make_hfs_fixture(fixture, 1u);
+    memcpy(fixture + FIXTURE_PLIST_OFFSET, CA_PLIST_STOCK, CA_PLIST_SIZE);
+    memcpy(fixture + FIXTURE_PPP_OFFSET, PPP_PLIST_STOCK, PPP_PLIST_SIZE);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write the two-rewrite fixture");
+
+    memset(&options, 0, sizeof(options));
+    options.ca_software_render = true;
+    options.ppp_launchd_job = true;
+    options.io_buffer_bytes = 13u;
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK && result.published,
+          "two-rewrite build returned %s/%s: %s",
+          rootfs_work_status_name(status), rootfs_work_stage_name(result.stage),
+          result.detail);
+    CHECK(result.ca_plist_offset == FIXTURE_PLIST_OFFSET &&
+          result.ppp_plist_offset == FIXTURE_PPP_OFFSET,
+          "two-rewrite build reported ca=0x%llx ppp=0x%llx",
+          (unsigned long long)result.ca_plist_offset,
+          (unsigned long long)result.ppp_plist_offset);
+    CHECK(result.final_size == FIXTURE_SIZE &&
+          file_size(destination) == FIXTURE_SIZE,
+          "two-rewrite build changed the image size to %llu",
+          (unsigned long long)file_size(destination));
+    CHECK(read_file(destination, published, sizeof(published)),
+          "could not read the two-rewrite work image");
+    CHECK(region_contains(published + FIXTURE_PLIST_OFFSET, CA_PLIST_SIZE,
+                          "<key>CA_ENABLE_MBX2D</key>"),
+          "the PPP rewrite displaced the renderer rewrite");
+    CHECK(region_contains(published + FIXTURE_PPP_OFFSET, PPP_PLIST_SIZE,
+                          "<string>/usr/sbin/pppd</string>"),
+          "the renderer rewrite displaced the PPP rewrite");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void expect_hfs_invalid(const uint8_t fixture[FIXTURE_SIZE],
+                               const char *tag, const char *detail_fragment) {
+    char source[160];
+    char destination[160];
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), tag),
+          "could not form malformed source path");
+    CHECK(make_path(destination, sizeof(destination), "malformed-work"),
+          "could not form malformed destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    CHECK(write_file(source, fixture, FIXTURE_SIZE),
+          "could not write malformed fixture");
+    CHECK(rootfs_work_create(source, destination, NULL, &result) ==
+              ROOTFS_WORK_HFS_INVALID,
+          "malformed HFS returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(strstr(result.detail, detail_fragment) != NULL,
+          "malformed HFS detail '%s' lacks '%s'", result.detail,
+          detail_fragment);
+    CHECK(!path_exists(destination) && no_temporary_files(),
+          "malformed HFS left output artifacts");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void test_malformed_hfs_refused(void) {
+    uint8_t fixture[FIXTURE_SIZE];
+    uint8_t *header;
+
+    make_hfs_fixture(fixture, 1u);
+    fixture[FIXTURE_SIZE - HFS_VH_OFF + 44u] ^= 1u;
+    expect_hfs_invalid(fixture, "alternate-mismatch", "headers disagree");
+
+    make_hfs_fixture(fixture, 1u);
+    fixture[FIXTURE_SIZE - HFS_VH_OFF + 128u] ^= 1u;
+    expect_hfs_invalid(fixture, "alternate-fork-mismatch", "headers disagree");
+
+    make_hfs_fixture(fixture, 1u);
+    bitmap_set(fixture, 1u, false);
+    expect_hfs_invalid(fixture, "free-head", "required metadata block 1");
+
+    make_hfs_fixture(fixture, 1u);
+    bitmap_set(fixture, 14u, false);
+    expect_hfs_invalid(fixture, "free-tail", "required metadata block 14");
+
+    make_hfs_fixture(fixture, 1u);
+    bitmap_set(fixture, 4u, false);
+    expect_hfs_invalid(fixture, "free-allocation-file",
+                       "required metadata block 4");
+
+    make_hfs_fixture(fixture, 1u);
+    header = fixture + HFS_VH_OFF;
+    put_be32(header + 136u, 6u); /* extent[1].start with count == 0 */
+    memcpy(fixture + FIXTURE_SIZE - HFS_VH_OFF, header, HFS_VH_LEN);
+    expect_hfs_invalid(fixture, "noncanonical-empty-extent",
+                       "empty allocation extent 1");
+
+    make_hfs_fixture(fixture, 1u);
+    header = fixture + HFS_VH_OFF;
+    put_be32(header + 124u, 2u);
+    put_be32(header + 144u, 6u); /* extent[2] after empty extent[1] */
+    put_be32(header + 148u, 1u);
+    memcpy(fixture + FIXTURE_SIZE - HFS_VH_OFF, header, HFS_VH_LEN);
+    expect_hfs_invalid(fixture, "gapped-extents",
+                       "follows an empty inline extent");
+
+    make_hfs_fixture(fixture, 1u);
+    header = fixture + HFS_VH_OFF;
+    put_be32(header + 4u, (1u << 8) | (1u << 15));
+    memcpy(fixture + FIXTURE_SIZE - HFS_VH_OFF, header, HFS_VH_LEN);
+    expect_hfs_invalid(fixture, "software-locked", "software-locked");
+
+    make_hfs_fixture(fixture, 1u);
+    header = fixture + HFS_VH_OFF;
+    put_be32(header + 4u, 0u);
+    memcpy(fixture + FIXTURE_SIZE - HFS_VH_OFF, header, HFS_VH_LEN);
+    expect_hfs_invalid(fixture, "dirty-mounted", "not cleanly unmounted");
+
+    make_hfs_fixture(fixture, 1u);
+    header = fixture + HFS_VH_OFF;
+    put_be32(header + 4u, (1u << 8) | (1u << 11));
+    memcpy(fixture + FIXTURE_SIZE - HFS_VH_OFF, header, HFS_VH_LEN);
+    expect_hfs_invalid(fixture, "boot-inconsistent", "boot-inconsistent");
+}
+
+static void test_source_preflight_is_read_only(void) {
+    uint8_t fixture[FIXTURE_SIZE];
+    uint8_t observed[FIXTURE_SIZE];
+    char source[160];
+    char destination[160];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), "preflight-source"),
+          "could not form preflight source path");
+    CHECK(make_path(destination, sizeof(destination), "witnessed-dirty-work"),
+          "could not form witnessed-dirty destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_hfs_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write preflight fixture");
+    CHECK(rootfs_work_validate_source(source, &result) == ROOTFS_WORK_OK &&
+          result.source_size == FIXTURE_SIZE && result.final_size == 0u &&
+          !result.published,
+          "clean preflight returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(read_file(source, observed, sizeof(observed)) &&
+          memcmp(observed, fixture, sizeof(fixture)) == 0,
+          "clean preflight changed its source");
+
+    put_be32(fixture + HFS_VH_OFF + 4u, 0u);
+    put_be32(fixture + FIXTURE_SIZE - HFS_VH_OFF + 4u, 0u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write dirty preflight fixture");
+    CHECK(rootfs_work_validate_source(source, &result) ==
+              ROOTFS_WORK_HFS_INVALID &&
+          result.stage == ROOTFS_WORK_STAGE_SOURCE_VALIDATE &&
+          strstr(result.detail, "not cleanly unmounted") != NULL &&
+          !result.published,
+          "dirty preflight returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(read_file(source, observed, sizeof(observed)) &&
+          memcmp(observed, fixture, sizeof(fixture)) == 0,
+          "dirty preflight changed its source");
+
+    CHECK(rootfs_work_validate_source_ex(source, true, &result) ==
+              ROOTFS_WORK_OK &&
+          result.source_unclean_accepted && !result.published,
+          "witnessed dirty preflight returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(read_file(source, observed, sizeof(observed)) &&
+          memcmp(observed, fixture, sizeof(fixture)) == 0,
+          "witnessed dirty preflight changed its source");
+
+    memset(&options, 0, sizeof(options));
+    options.preserve_fstab = true;
+    options.allow_unclean_source = true;
+    CHECK(rootfs_work_create(source, destination, &options, &result) ==
+              ROOTFS_WORK_OK &&
+          result.published && result.source_unclean_accepted,
+          "witnessed dirty clone returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(read_file(destination, observed, sizeof(observed)) &&
+          memcmp(observed, fixture, sizeof(fixture)) == 0,
+          "witnessed dirty clone changed the dirty HFS bytes");
+    remove_if_present(destination);
+
+    put_be32(fixture + HFS_VH_OFF + 4u, 1u << 11);
+    put_be32(fixture + FIXTURE_SIZE - HFS_VH_OFF + 4u, 1u << 11);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write boot-inconsistent dirty fixture");
+    CHECK(rootfs_work_validate_source_ex(source, true, &result) ==
+              ROOTFS_WORK_HFS_INVALID &&
+          strstr(result.detail, "boot-inconsistent") != NULL &&
+          !result.published,
+          "witness bypassed boot-inconsistent HFS: %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(read_file(source, observed, sizeof(observed)) &&
+          memcmp(observed, fixture, sizeof(fixture)) == 0,
+          "boot-inconsistent refusal changed its source");
+    remove_if_present(source);
+}
+
+static void make_overlapping_reserved_fixture(uint8_t image[2048]) {
+    uint8_t *header;
+
+    memset(image, 0, 2048u);
+    header = image + HFS_VH_OFF;
+    put_be16(header, 0x4858u);
+    put_be16(header + 2u, 5u);
+    put_be32(header + 4u, 1u << 8);
+    put_be32(header + 40u, FIXTURE_BLOCK_SIZE);
+    put_be32(header + 44u, 4u);
+    put_be32(header + 48u, 0u);
+    put_be32(header + 52u, 0u);
+    put_be64(header + 112u, 1u);
+    put_be32(header + 124u, 1u);
+    put_be32(header + 128u, 3u);
+    put_be32(header + 132u, 1u);
+    image[3u * FIXTURE_BLOCK_SIZE] = 0xf0u; /* blocks 0..3 allocated */
+    memcpy(image + FIXTURE_BLOCK_SIZE, FSTAB_STOCK,
+           sizeof(FSTAB_STOCK) - 1u);
+    /* At 2048 bytes, primary and alternate headers are the same 512 bytes. */
+}
+
+static void test_growth_rejects_head_tail_overlap(void) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[2048];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), "overlap-source"),
+          "could not form overlap source path");
+    CHECK(make_path(destination, sizeof(destination), "overlap-work"),
+          "could not form overlap destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_overlapping_reserved_fixture(fixture);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write overlap fixture");
+    memset(&options, 0, sizeof(options));
+    options.growth_bytes = 4u * FIXTURE_BLOCK_SIZE;
+    options.io_buffer_bytes = 13u;
+    CHECK(rootfs_work_create(source, destination, &options, &result) ==
+              ROOTFS_WORK_HFS_INVALID &&
+          result.stage == ROOTFS_WORK_STAGE_GROW_PLAN,
+          "head/tail overlap returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(strstr(result.detail, "head and tail") != NULL,
+          "head/tail refusal detail was '%s'", result.detail);
+    CHECK(!path_exists(destination) && no_temporary_files(),
+          "head/tail overlap left output artifacts");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static void test_existing_destination_preserved(void) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    uint8_t sentinel[] = {0x51u, 0x62u, 0x73u, 0x84u};
+    uint8_t observed[sizeof(sentinel)];
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), "existing-source"),
+          "could not form source path");
+    CHECK(make_path(destination, sizeof(destination), "existing-destination"),
+          "could not form destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_hfs_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write source fixture");
+    CHECK(write_file(destination, sentinel, sizeof(sentinel)),
+          "could not write destination sentinel");
+    CHECK(rootfs_work_create(source, destination, NULL, &result) ==
+              ROOTFS_WORK_DESTINATION_EXISTS,
+          "existing destination returned %s/%s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage));
+    CHECK(read_file(destination, observed, sizeof(observed)) &&
+          memcmp(sentinel, observed, sizeof(sentinel)) == 0 &&
+          file_size(destination) == sizeof(sentinel),
+          "existing destination was changed");
+    CHECK(no_temporary_files(), "existing destination created a temp file");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static bool make_hard_link(const char *existing, const char *alias) {
+#ifdef _WIN32
+    return CreateHardLinkA(alias, existing, NULL) != 0;
+#else
+    return link(existing, alias) == 0;
+#endif
+}
+
+static void test_source_hardlink_refused(void) {
+    char source[160];
+    char alias[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), "hardlink-source"),
+          "could not form source path");
+    CHECK(make_path(alias, sizeof(alias), "hardlink-alias"),
+          "could not form alias path");
+    CHECK(make_path(destination, sizeof(destination), "hardlink-work"),
+          "could not form destination path");
+    remove_if_present(source);
+    remove_if_present(alias);
+    remove_if_present(destination);
+    make_hfs_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write hard-link fixture");
+    if (make_hard_link(source, alias)) {
+        CHECK(rootfs_work_create(source, destination, NULL, &result) ==
+                  ROOTFS_WORK_SOURCE_ALIAS,
+              "hard-linked source returned %s/%s",
+              rootfs_work_status_name(result.status),
+              rootfs_work_stage_name(result.stage));
+        CHECK(!path_exists(destination) && no_temporary_files(),
+              "hard-linked source created output artifacts");
+    } else {
+        CHECK(false, "could not create hard-link fixture (error %d)", errno);
+    }
+    remove_if_present(destination);
+    remove_if_present(alias);
+    remove_if_present(source);
+}
+
+#ifndef _WIN32
+static void test_symbolic_links_refused(void) {
+    char source[160];
+    char source_link[160];
+    char destination[160];
+    char destination_link[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    rootfs_work_result_t result;
+
+    CHECK(make_path(source, sizeof(source), "symlink-source"),
+          "could not form source path");
+    CHECK(make_path(source_link, sizeof(source_link), "symlink-source-link"),
+          "could not form source-link path");
+    CHECK(make_path(destination, sizeof(destination), "symlink-work"),
+          "could not form destination path");
+    CHECK(make_path(destination_link, sizeof(destination_link),
+                    "symlink-destination"),
+          "could not form destination-link path");
+    remove_if_present(source);
+    remove_if_present(source_link);
+    remove_if_present(destination);
+    remove_if_present(destination_link);
+    make_hfs_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write symlink fixture");
+    CHECK(symlink(source, source_link) == 0,
+          "could not create source symlink: %d", errno);
+    CHECK(rootfs_work_create(source_link, destination, NULL, &result) ==
+              ROOTFS_WORK_PATH_UNSAFE,
+          "source symlink returned %s/%s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage));
+    CHECK(!path_exists(destination), "source symlink published output");
+    CHECK(symlink(source, destination_link) == 0,
+          "could not create destination symlink: %d", errno);
+    CHECK(rootfs_work_create(source, destination_link, NULL, &result) ==
+              ROOTFS_WORK_PATH_UNSAFE,
+          "destination symlink returned %s/%s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage));
+    CHECK(no_temporary_files(), "symlink refusals created temp artifacts");
+    remove_if_present(destination_link);
+    remove_if_present(destination);
+    remove_if_present(source_link);
+    remove_if_present(source);
+}
+#endif
+
+static void test_argument_and_growth_guards(void) {
+    char source[160];
+    char destination[160];
+    uint8_t fixture[FIXTURE_SIZE];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+
+    CHECK(rootfs_work_create("x", "y", NULL, NULL) ==
+              ROOTFS_WORK_INVALID_ARGUMENT,
+          "NULL result was accepted");
+    memset(&options, 0, sizeof(options));
+    options.io_buffer_bytes = ROOTFS_WORK_MAX_IO_BUFFER + 1u;
+    CHECK(rootfs_work_create("x", "y", &options, &result) ==
+              ROOTFS_WORK_INVALID_ARGUMENT &&
+          result.stage == ROOTFS_WORK_STAGE_ARGUMENTS,
+          "oversized I/O buffer was accepted");
+
+    CHECK(make_path(source, sizeof(source), "tiny-grow"),
+          "could not form source path");
+    CHECK(make_path(destination, sizeof(destination), "tiny-grow-work"),
+          "could not form destination path");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_hfs_fixture(fixture, 1u);
+    CHECK(write_file(source, fixture, sizeof(fixture)),
+          "could not write tiny-growth fixture");
+    memset(&options, 0, sizeof(options));
+    options.growth_bytes = FIXTURE_BLOCK_SIZE;
+    options.io_buffer_bytes = 31u;
+    CHECK(rootfs_work_create(source, destination, &options, &result) ==
+              ROOTFS_WORK_GROW_INVALID,
+          "sub-minimum growth returned %s/%s: %s",
+          rootfs_work_status_name(result.status),
+          rootfs_work_stage_name(result.stage), result.detail);
+    CHECK(!path_exists(destination) && no_temporary_files(),
+          "rejected growth left output artifacts");
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
+static bool seek64(FILE *f, uint64_t offset) {
+#ifdef _WIN32
+    return _fseeki64(f, (__int64)offset, SEEK_SET) == 0;
+#else
+    return fseeko(f, (off_t)offset, SEEK_SET) == 0;
+#endif
+}
+
+static uint64_t allocated_bytes(const char *path) {
+#ifdef _WIN32
+    DWORD high = 0;
+    SetLastError(NO_ERROR);
+    DWORD low = GetCompressedFileSizeA(path, &high);
+    if (low == INVALID_FILE_SIZE && GetLastError() != NO_ERROR) return UINT64_MAX;
+    return ((uint64_t)high << 32) | low;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_blocks < 0) return UINT64_MAX;
+    return (uint64_t)st.st_blocks * 512u;
+#endif
+}
+
+static void test_sparse_capacity_and_maintenance_copy(uint64_t capacity) {
+    char source[160], grown[160], clone[160];
+    enum { LARGE_BLOCK_SIZE = 4096u, LARGE_FIXTURE_SIZE = LARGE_BLOCK_SIZE * FIXTURE_BLOCKS };
+    uint8_t fixture[LARGE_FIXTURE_SIZE], primary[HFS_VH_LEN], alternate[HFS_VH_LEN];
+    CHECK(make_path(source, sizeof source, "capacity-source") &&
+          make_path(grown, sizeof grown, "capacity-grown") &&
+          make_path(clone, sizeof clone, "capacity-maintenance"), "capacity paths");
+    /* Match the real root volume's 4 KiB allocation blocks. A synthetic 512 B
+     * block at 8 GiB exceeds the provisioner's deliberate 1 MiB bitmap cap. */
+    memset(fixture, 0, sizeof fixture);
+    make_hfs_fixture(fixture, 1u);
+    memcpy(fixture + 4u * LARGE_BLOCK_SIZE, fixture + FIXTURE_BITMAP_OFFSET, 8);
+    memset(fixture + FIXTURE_BITMAP_OFFSET, 0, 8);
+    memset(fixture + FIXTURE_SIZE - HFS_VH_OFF, 0, HFS_VH_LEN);
+    put_be32(fixture + HFS_VH_OFF + 40, LARGE_BLOCK_SIZE);
+    memcpy(fixture + sizeof fixture - HFS_VH_OFF, fixture + HFS_VH_OFF, HFS_VH_LEN);
+    CHECK(write_file(source, fixture, sizeof fixture), "capacity fixture");
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    memset(&options, 0, sizeof options);
+    options.preserve_fstab = true;
+    options.minimum_volume_bytes = capacity;
+    CHECK(rootfs_work_create(source, grown, &options, &result) == ROOTFS_WORK_OK,
+          "capacity grow: %s", result.detail);
+    if (!result.published) { remove_if_present(source); return; }
+    CHECK(file_size(grown) == capacity, "logical capacity changed");
+    CHECK(allocated_bytes(grown) < capacity / 4u, "sparse growth allocated the whole disk");
+    FILE *f = fopen(grown, "r+b");
+    uint64_t high_offset = capacity - 1024u * 1024u;
+    static const uint8_t marker[] = {0x73,0x35,0x6c,0x42,0x6f,0x78,0xa5,0x5a};
+    CHECK(f != NULL, "open grown volume");
+    if (f) {
+        CHECK(seek64(f, HFS_VH_OFF) && fread(primary, 1, sizeof primary, f) == sizeof primary,
+              "primary header read");
+        CHECK(seek64(f, capacity - HFS_VH_OFF) && fread(alternate, 1, sizeof alternate, f) == sizeof alternate,
+              "64-bit alternate header read");
+        CHECK(get_be32(primary + 44) == capacity / LARGE_BLOCK_SIZE &&
+              memcmp(primary, alternate, sizeof primary) == 0, "large HFS geometry mismatch");
+        CHECK(seek64(f, high_offset) && fwrite(marker, 1, sizeof marker, f) == sizeof marker,
+              "high-offset marker write");
+        CHECK(fclose(f) == 0, "close grown volume");
+    }
+    CHECK(rootfs_work_create(grown, clone, &options, &result) == ROOTFS_WORK_OK,
+          "maintenance clone: %s", result.detail);
+    if (result.published) {
+        CHECK(file_size(clone) == capacity && allocated_bytes(clone) < capacity / 4u,
+              "maintenance materialized sparse disk");
+        uint8_t actual[sizeof marker] = {0};
+        f = fopen(clone, "rb");
+        CHECK(f && seek64(f, high_offset) && fread(actual, 1, sizeof actual, f) == sizeof actual &&
+              memcmp(marker, actual, sizeof marker) == 0, "maintenance lost high-offset data");
+        if (f) fclose(f);
+    }
+    remove_if_present(clone); remove_if_present(grown); remove_if_present(source);
+}
+
+typedef struct { unsigned calls, limit; } cancel_copy_t;
+static bool cancel_copy(void *ctx) {
+    cancel_copy_t *cancel = ctx;
+    return ++cancel->calls >= cancel->limit;
+}
+static void test_cancelled_preparation_has_no_published_disk(void) {
+    char source[160], destination[160];
+    uint8_t original[FIXTURE_SIZE], after[FIXTURE_SIZE];
+    CHECK(make_path(source, sizeof source, "cancel-source"), "source path");
+    CHECK(make_path(destination, sizeof destination, "cancel-work"), "destination path");
+    remove_if_present(source); remove_if_present(destination);
+    make_hfs_fixture(original, 1u);
+    CHECK(write_file(source, original, sizeof original), "source fixture");
+    const unsigned limits[] = {1, 2, (FIXTURE_SIZE + 1023) / 1024 + 1};
+    for (unsigned i = 0; i < 3; i++) {
+        cancel_copy_t cancel = {0, limits[i]};
+        rootfs_work_options_t options = {0};
+        options.io_buffer_bytes = 1024;
+        options.cancel = cancel_copy; options.cancel_ctx = &cancel;
+        rootfs_work_result_t result;
+        CHECK(rootfs_work_create(source, destination, &options, &result) == ROOTFS_WORK_CANCELLED,
+              "cancellation at %u failed: %s", limits[i], result.detail);
+        CHECK(!result.published && !result.temporary_left && !path_exists(destination) && no_temporary_files(),
+              "cancelled preparation published a disk or leaked its temporary");
+    }
+    CHECK(read_file(source, after, sizeof after) && !memcmp(original, after, sizeof original),
+          "cancellation modified source");
+    remove_if_present(source);
+}
+
+int main(int argc, char **argv) {
+    test_cancelled_preparation_has_no_published_disk();
+    if (argc == 2 && strcmp(argv[1], "--large-disks") == 0) {
+        test_sparse_capacity_and_maintenance_copy(UINT64_C(4) << 30);
+        test_sparse_capacity_and_maintenance_copy(UINT64_C(8) << 30);
+        printf("large disks: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    printf("rootfs work-image provisioner tests\n");
+    test_sha256_known_answers_and_chunking();
+    test_sha256_invalid_and_overflow_guards();
+    test_success_boundary_growth_and_source_immutable();
+    test_minimum_volume_expands_allocation_file();
+    test_sparse_capacity_and_maintenance_copy(UINT64_C(64) << 20);
+    test_stale_alternate_accounting_is_accepted();
+    test_required_identity_chunk_boundaries();
+    test_source_identity_policy_and_cleanup();
+    test_fstab_uniqueness_and_cleanup();
+    test_ca_software_render_plist();
+    test_ppp_launchd_job_plist();
+    test_both_plist_rewrites_in_one_build();
+    test_source_preflight_is_read_only();
+    test_malformed_hfs_refused();
+    test_growth_rejects_head_tail_overlap();
+    test_existing_destination_preserved();
+    test_source_hardlink_refused();
+#ifndef _WIN32
+    test_symbolic_links_refused();
+#endif
+    test_argument_and_growth_guards();
+    printf("\nrootfs-work: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}

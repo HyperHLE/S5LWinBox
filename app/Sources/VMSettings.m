@@ -1,0 +1,578 @@
+//
+//  S5LBox — the app's settings. See VMSettings.h.
+//
+//  Explicit saved choices take precedence over the product's new-machine
+//  defaults. Desktop baseline defaults remain separate for exact replay flags
+//  and for old graphics images without a trustworthy per-machine record.
+//
+//  Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+//
+#import "VMSettings.h"
+#import "VMFirmwareStore.h"
+
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+
+#import "VMOptions.h"
+
+NSString *const VMSettingsDidChangeNotification =
+    @"VMSettingsDidChangeNotification";
+
+/* The names the importer writes and the emulator accepts, per
+ * docs/BOOT_CHAIN.md's "Regenerating the three accepted inputs". They were
+ * "kernelcache", "DeviceTree" and "rootfs.dmg" until the importer existed,
+ * which named the IPSW's own members rather than anything produced from them. */
+NSString *const VMFirmwareKernelFile           = @"kernel.macho";
+NSString *const VMFirmwareDeviceTreeFile       = @"devicetree.bin";
+NSString *const VMFirmwareRootFilesystemFile   = @"rootfs.img";
+NSString *const VMFirmwareJailbreakPayloadFile = @"jailbreak-payload";
+
+static NSString *const kVMOptionKeyPrefix   = @"vm.option.";
+static NSString *const kVMInstructionCapKey = @"vm.diag.instructionCap";
+static NSString *const kVMPauseInBackground = @"vm.diag.pauseInBackground";
+static NSString *const kVMDeveloperMode = @"VMDeveloperMode";
+static NSString *const kVMInlineConsole = @"VMInlineConsole";
+static NSString *const kVMLegacyEmulatorUI = @"VMLegacyEmulatorUI";
+static NSString *const kVMHomeOnlyEmulatorUI = @"VMHomeOnlyEmulatorUI";
+static NSString *const kVMPackagesWithJailbreak = @"VMPackagesWithJailbreak";
+static NSString *const kVMAppSyncWithJailbreak = @"VMAppSyncWithJailbreak";
+static NSString *const kVMGuestMicrophoneEnabled = @"VMGuestMicrophoneEnabled";
+static NSString *const kVMSkipFirmwareChecksums = @"VMSkipFirmwareChecksums";
+static NSString *const kVMNewMachineDiskSizeGiB = @"VMNewMachineDiskSizeGiB";
+
+/*
+ * The instruction caps the screen cycles through. 0 first because no limit is
+ * the default and the cycle should start where the app starts; the rest are
+ * spaced an order of magnitude apart because that is the resolution at which
+ * "how far did it get" is actually a question — the demo guest retires a few
+ * million a second, and a real boot reaches 4.97e9 before it draws anything.
+ */
+static const uint64_t kVMInstructionCaps[] = {
+    0ull, 10000000ull, 100000000ull, 1000000000ull, 10000000000ull
+};
+#define kVMInstructionCapCount \
+    ((NSUInteger)(sizeof kVMInstructionCaps / sizeof kVMInstructionCaps[0]))
+
+// Declared up front so every call below is checked against a prototype.
+@interface VMSettings () {
+    /* One immutable-in-practice pair selected before an engine starts. It is
+     * read by both the main-thread boot probe and the background provisioner,
+     * so every access is under the same monitor rather than three atomic
+     * properties that could expose a mixed pair. */
+    BOOL _recordedGraphicsActive;
+    BOOL _recordedGraphicsMBX;
+    BOOL _recordedGraphicsSoftware;
+}
+- (NSUserDefaults *)defaults;
+- (NSString *)keyForOptionIndex:(NSUInteger)index;
+- (void)publishChange;
+@end
+
+@implementation VMSettings
+
++ (instancetype)sharedSettings {
+    static VMSettings *shared;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ shared = [[VMSettings alloc] init]; });
+    return shared;
+}
+
+- (NSUserDefaults *)defaults {
+    return [NSUserDefaults standardUserDefaults];
+}
+
+- (BOOL)ringerSilentForInstanceID:(NSString *)identifier {
+    if (!identifier.length) return NO;
+    id value = [[self defaults] objectForKey:[@"vm.machine.ringerSilent." stringByAppendingString:identifier]];
+    return [value isKindOfClass:NSNumber.class] && [value isEqualToNumber:@YES];
+}
+
+- (void)setRingerSilent:(BOOL)silent forInstanceID:(NSString *)identifier {
+    if (!identifier.length) return;
+    [[self defaults] setBool:silent forKey:[@"vm.machine.ringerSilent." stringByAppendingString:identifier]];
+}
+
+- (void)publishChange {
+    /* Posted synchronously on whichever thread wrote, which is always the main
+     * thread here: everything that writes is a control in a table view. */
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:VMSettingsDidChangeNotification object:self];
+}
+
+- (BOOL)legacyEmulatorUI { return [[self defaults] boolForKey:kVMLegacyEmulatorUI]; }
+- (BOOL)homeOnlyEmulatorUI { return [[self defaults] boolForKey:kVMHomeOnlyEmulatorUI]; }
+- (void)setHomeOnlyEmulatorUI:(BOOL)homeOnly {
+    [[self defaults] setBool:homeOnly forKey:kVMHomeOnlyEmulatorUI];
+    [self publishChange];
+}
+- (void)setLegacyEmulatorUI:(BOOL)legacy {
+    [[self defaults] setBool:legacy forKey:kVMLegacyEmulatorUI];
+    [self publishChange];
+}
+
+- (BOOL)packagesWithJailbreak {
+    NSNumber *stored = [[self defaults] objectForKey:kVMPackagesWithJailbreak];
+    return [stored isKindOfClass:NSNumber.class] ? stored.boolValue : YES;
+}
+
+- (void)setPackagesWithJailbreak:(BOOL)enabled {
+    [[self defaults] setBool:enabled forKey:kVMPackagesWithJailbreak];
+    [self publishChange];
+}
+
+- (BOOL)guestMicrophoneEnabled {
+    NSNumber *stored = [[self defaults] objectForKey:kVMGuestMicrophoneEnabled];
+    return [stored isKindOfClass:NSNumber.class] ? stored.boolValue : YES;
+}
+
+- (BOOL)appSyncWithJailbreak {
+    id stored = [[self defaults] objectForKey:kVMAppSyncWithJailbreak];
+    return [stored isKindOfClass:NSNumber.class] ? [stored boolValue] : YES;
+}
+
+- (void)setAppSyncWithJailbreak:(BOOL)enabled {
+    [[self defaults] setBool:enabled forKey:kVMAppSyncWithJailbreak];
+    [self publishChange];
+}
+
+- (BOOL)skipFirmwareChecksums {
+    id stored = [[self defaults] objectForKey:kVMSkipFirmwareChecksums];
+    return [stored isKindOfClass:NSNumber.class] && [stored isEqualToNumber:@YES];
+}
+
+- (void)setSkipFirmwareChecksums:(BOOL)skip {
+    [[self defaults] setBool:skip forKey:kVMSkipFirmwareChecksums];
+    [self publishChange];
+}
+
+- (void)setGuestMicrophoneEnabled:(BOOL)enabled {
+    [[self defaults] setBool:enabled forKey:kVMGuestMicrophoneEnabled];
+    [self publishChange];
+}
+
+- (NSUInteger)newMachineDiskSizeGiB {
+    NSNumber *stored = [[self defaults] objectForKey:kVMNewMachineDiskSizeGiB];
+    if (![stored isKindOfClass:NSNumber.class]) return 8;
+    for (NSNumber *choice in @[@2, @4, @8]) {
+        if ([stored isEqualToNumber:choice]) return choice.unsignedIntegerValue;
+    }
+    return 8;
+}
+
+- (void)setNewMachineDiskSizeGiB:(NSUInteger)gib {
+    if (gib != 2 && gib != 4 && gib != 8) return;
+    [[self defaults] setInteger:(NSInteger)gib forKey:kVMNewMachineDiskSizeGiB];
+    [self publishChange];
+}
+
+#pragma mark - Recorded only
+
+- (NSString *)keyForOptionIndex:(NSUInteger)index {
+    const vm_option_t *option = vm_option_at((unsigned)index);
+    if (!option || !option->name) return nil;
+    return [kVMOptionKeyPrefix stringByAppendingString:
+            [NSString stringWithUTF8String:option->name]];
+}
+
+- (BOOL)valueForNewMachineOptionIndex:(NSUInteger)index {
+    const vm_option_t *option = vm_option_at((unsigned)index);
+    if (!option) return NO;
+
+    NSString *key = [self keyForOptionIndex:index];
+    NSNumber *stored = key ? [[self defaults] objectForKey:key] : nil;
+    BOOL hasSavedValue = [stored isKindOfClass:[NSNumber class]];
+    return vm_option_new_machine_value((unsigned)index, hasSavedValue,
+                                       hasSavedValue ? stored.boolValue : NO);
+}
+
+- (BOOL)valueForOptionIndex:(NSUInteger)index {
+    int mbx = vm_option_index("mbx");
+    int ca = vm_option_index("ca-software-render");
+
+    @synchronized (self) {
+        if (_recordedGraphicsActive) {
+            if (mbx >= 0 && index == (NSUInteger)mbx)
+                return _recordedGraphicsMBX;
+            if (ca >= 0 && index == (NSUInteger)ca)
+                return _recordedGraphicsSoftware;
+        }
+    }
+    /* No graphics record means an older, already-created image (or the demo).
+     * Preserve its former global fallback; new product defaults must not
+     * silently switch the driver underneath a CPU-renderer disk. New images
+     * select their recorded pair before reaching this method. */
+    if ((mbx >= 0 && index == (NSUInteger)mbx) ||
+        (ca >= 0 && index == (NSUInteger)ca)) {
+        NSNumber *stored = [[self defaults] objectForKey:[self keyForOptionIndex:index]];
+        if ([stored isKindOfClass:[NSNumber class]]) return stored.boolValue;
+        return vm_option_at((unsigned)index)->def;
+    }
+    return [self valueForNewMachineOptionIndex:index];
+}
+
+- (void)useRecordedGraphicsForMachineWithMBX:(BOOL)mbxEnabled
+                            softwareRenderer:(BOOL)softwareRendererEnabled {
+    @synchronized (self) {
+        _recordedGraphicsMBX = mbxEnabled;
+        _recordedGraphicsSoftware = softwareRendererEnabled;
+        _recordedGraphicsActive = YES;
+    }
+}
+
+- (void)clearRecordedGraphicsForMachine {
+    @synchronized (self) {
+        _recordedGraphicsActive = NO;
+        _recordedGraphicsMBX = NO;
+        _recordedGraphicsSoftware = NO;
+    }
+}
+
+- (void)setValue:(BOOL)value forOptionIndex:(NSUInteger)index {
+    NSString *key = [self keyForOptionIndex:index];
+    if (!key) return;
+    [[self defaults] setBool:value forKey:key];
+    [self publishChange];
+}
+
+- (VMGraphicsMode)graphicsModeForNewMachines {
+    int mbx = vm_option_index("mbx");
+    int ca = vm_option_index("ca-software-render");
+    if (mbx < 0 || ca < 0) return VMGraphicsModeCustom;
+
+    BOOL mbxEnabled = [self valueForNewMachineOptionIndex:(NSUInteger)mbx];
+    BOOL softwareEnabled =
+        [self valueForNewMachineOptionIndex:(NSUInteger)ca];
+    if (!mbxEnabled && softwareEnabled) return VMGraphicsModeSoftware;
+    if (mbxEnabled && !softwareEnabled)
+        return VMGraphicsModeExperimentalMBX;
+    return VMGraphicsModeCustom;
+}
+
+- (void)setGraphicsModeForNewMachines:(VMGraphicsMode)mode {
+    if (mode != VMGraphicsModeSoftware &&
+        mode != VMGraphicsModeExperimentalMBX) return;
+
+    int mbx = vm_option_index("mbx");
+    int ca = vm_option_index("ca-software-render");
+    if (mbx < 0 || ca < 0) return;
+
+    NSString *mbxKey = [self keyForOptionIndex:(NSUInteger)mbx];
+    NSString *caKey = [self keyForOptionIndex:(NSUInteger)ca];
+    if (!mbxKey || !caKey) return;
+
+    /* One observer-visible change, not the transient mbx-on/software-on state
+     * produced by calling -setValue: twice. NSUserDefaults writes themselves
+     * are synchronous in this process; publish only after both are present. */
+    BOOL useMBX = mode == VMGraphicsModeExperimentalMBX;
+    NSUserDefaults *defaults = [self defaults];
+    [defaults setBool:useMBX forKey:mbxKey];
+    [defaults setBool:!useMBX forKey:caKey];
+    [self publishChange];
+}
+
+- (NSString *)equivalentToggleArguments {
+    const unsigned count = vm_option_count();
+    if (count == 0) return @"(no options)";
+
+    /* NSMutableData rather than malloc: the buffer is then owned by ARC and
+     * cannot be leaked by an early return added later. */
+    NSMutableData *values = [NSMutableData dataWithLength:count * sizeof(bool)];
+    bool *slots = (bool *)values.mutableBytes;
+    if (!slots) return @"(unavailable)";
+    for (unsigned i = 0; i < count; i++)
+        slots[i] = [self valueForNewMachineOptionIndex:i] ? true : false;
+
+    const size_t needed = vm_option_command_line(slots, count, NULL, 0);
+    if (needed == 0) return @"(every option is at its default)";
+
+    NSMutableData *text = [NSMutableData dataWithLength:needed + 1];
+    char *out = (char *)text.mutableBytes;
+    if (!out) return @"(unavailable)";
+    vm_option_command_line(slots, count, out, needed + 1);
+
+    NSString *rendered = [NSString stringWithUTF8String:out];
+    return rendered ?: @"(unavailable)";
+}
+
+#pragma mark - Applied
+
+- (uint64_t)instructionCap {
+    NSNumber *stored = [[self defaults] objectForKey:kVMInstructionCapKey];
+    if (![stored isKindOfClass:[NSNumber class]]) return 0;
+    long long value = stored.longLongValue;
+    return value > 0 ? (uint64_t)value : 0;
+}
+
+- (void)setInstructionCap:(uint64_t)cap {
+    /* Stored as a signed long long because that is what a property list can
+     * hold; the caps offered are nowhere near the boundary. */
+    [[self defaults] setObject:@((long long)cap) forKey:kVMInstructionCapKey];
+    [self publishChange];
+}
+
+- (uint64_t)nextInstructionCap {
+    const uint64_t current = [self instructionCap];
+    for (NSUInteger i = 0; i < kVMInstructionCapCount; i++) {
+        if (kVMInstructionCaps[i] != current) continue;
+        return kVMInstructionCaps[(i + 1) % kVMInstructionCapCount];
+    }
+    // A value from an older build, or none: rejoin the cycle at the start.
+    return kVMInstructionCaps[0];
+}
+
++ (NSArray<NSNumber *> *)instructionCapChoices {
+    NSMutableArray<NSNumber *> *choices = [NSMutableArray array];
+    for (NSUInteger i = 0; i < kVMInstructionCapCount; i++)
+        [choices addObject:@(kVMInstructionCaps[i])];
+    return [choices copy];
+}
+
+- (BOOL)jailbreakEnabled {
+    /* Both halves, or it is not on. A half-jailbroken machine is a state the
+     * harness supports and this switch deliberately cannot express. */
+    int cs = vm_option_index("jb-codesign");
+    int pl = vm_option_index("jb-payload");
+    if (cs < 0 || pl < 0) return NO;
+    return [self valueForNewMachineOptionIndex:(NSUInteger)cs] &&
+           [self valueForNewMachineOptionIndex:(NSUInteger)pl];
+}
+
+- (void)setJailbreakEnabled:(BOOL)enabled {
+    int cs = vm_option_index("jb-codesign");
+    int pl = vm_option_index("jb-payload");
+    if (cs >= 0) [self setValue:enabled forOptionIndex:(NSUInteger)cs];
+    if (pl >= 0) [self setValue:enabled forOptionIndex:(NSUInteger)pl];
+}
+
+- (BOOL)inlineConsole {
+    return [[self defaults] boolForKey:kVMInlineConsole];
+}
+
+- (void)setInlineConsole:(BOOL)inline_ {
+    [[self defaults] setBool:inline_ forKey:kVMInlineConsole];
+    [self publishChange];
+}
+
+- (BOOL)developerMode {
+    /* Absent means off. A first launch is somebody who has not asked for the
+     * harness's option table, so they do not get it. */
+    return [[self defaults] boolForKey:kVMDeveloperMode];
+}
+
+- (void)setDeveloperMode:(BOOL)enabled {
+    [[self defaults] setBool:enabled forKey:kVMDeveloperMode];
+    [self publishChange];
+}
+
+- (BOOL)pausesInBackground {
+    NSNumber *stored = [[self defaults] objectForKey:kVMPauseInBackground];
+    if (![stored isKindOfClass:[NSNumber class]]) return YES;
+    return stored.boolValue;
+}
+
+- (void)setPausesInBackground:(BOOL)pauses {
+    [[self defaults] setBool:pauses forKey:kVMPauseInBackground];
+    [self publishChange];
+}
+
+#pragma mark - Firmware
+
+- (NSString *)documentsDirectory {
+    NSArray<NSString *> *documents = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *raw = documents.firstObject;
+    if (raw.length == 0) return raw;
+
+    /*
+     * PHYSICALLY RESOLVED, and this is not cosmetic.
+     *
+     * On iOS this comes back as /var/mobile/Containers/Data/Application/<id>/
+     * Documents, and /var is a SYMLINK to /private/var. rootfs_work.c walks
+     * every component of a path with AT_SYMLINK_NOFOLLOW and refuses any that
+     * is a link -- which is the right rule for a path a user typed, and which
+     * refuses this one at its very first component. The observed failure was
+     * "unsafe-path at source-path: source path traverses a symbolic link or
+     * '..'", and the emulator was correct to say it.
+     *
+     * So the fix is here rather than there: hand it the physical path and the
+     * walker's guarantee is untouched. realpath() is used rather than
+     * -stringByResolvingSymlinksInPath, which Apple documents as deliberately
+     * NOT resolving /private prefixes -- the exact prefix that matters.
+     *
+     * Resolved once and cached, because it cannot change while the app is
+     * running and realpath() touches the filesystem.
+     */
+    static NSString *resolved;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        char buf[PATH_MAX];
+        const char *in = [raw fileSystemRepresentation];
+        if (in && realpath(in, buf))
+            resolved = [[NSFileManager defaultManager]
+                stringWithFileSystemRepresentation:buf length:strlen(buf)];
+        if (resolved.length == 0) resolved = raw;   /* better than nothing */
+    });
+    return resolved;
+}
+
+- (BOOL)ensureUserVisibleDirectories {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = [self documentsDirectory];
+    if (root.length == 0) return NO;
+
+    /*
+     * firmware/ is where the three files live and where an IPSW is dropped.
+     * Machines/ is where per-machine work images really go -- see
+     * VMInstanceStore's containerDirectory, which moved them here out of
+     * Application Support precisely so this folder is not a decoy. Created at
+     * launch so a user who opens Files sees the shape of the thing rather than
+     * one folder that appears later for no visible reason.
+     */
+    NSArray<NSString *> *wanted = @[
+        [root stringByAppendingPathComponent:@"firmware"],
+        [root stringByAppendingPathComponent:@"Machines"],
+    ];
+    BOOL ok = YES;
+    for (NSString *dir in wanted) {
+        NSError *error = nil;
+        if (![fm createDirectoryAtPath:dir
+           withIntermediateDirectories:YES
+                            attributes:nil
+                                 error:&error]) {
+            if (![fm fileExistsAtPath:dir]) ok = NO;
+        }
+    }
+
+    /*
+     * A README, written once and never overwritten -- if the user edits or
+     * deletes it that is their answer, and rewriting it every launch would
+     * undo that silently.
+     */
+    NSString *readme = [[wanted.firstObject
+        stringByAppendingPathComponent:@"README.txt"] copy];
+    if (readme && ![fm fileExistsAtPath:readme]) {
+        NSString *text =
+            @"S5LBox firmware folder\n"
+            @"======================\n"
+            @"\n"
+            @"Put an IPSW here. Any file ending in .ipsw in this folder (or one\n"
+            @"level up, in the S5LBox folder itself) is found by the Firmware\n"
+            @"setup screen automatically when you return -- no file picker needed.\n"
+            @"\n"
+            @"Verified imports live in a prepared-* folder selected by\n"
+            @"current-firmware.txt. Existing loose firmware files still work.\n"
+            @"The importer produces:\n"
+            @"\n"
+            @"    kernel.macho      the kernelcache, decrypted and decompressed\n"
+            @"    devicetree.bin    the device tree, decrypted\n"
+            @"    rootfs.img        the root filesystem, decrypted and expanded\n"
+            @"\n"
+            @"Public keys for iPhone1,2 / iPhone OS 3.1.3 / 7E18 are included.\n"
+            @"Import your IPSW; no key entry is required. Advanced manual\n"
+            @"overrides in Settings are held only for the current app session.\n"
+            @"\n"
+            @"Open Settings > Firmware to manage firmware.\n";
+        [text writeToFile:readme atomically:YES
+                 encoding:NSUTF8StringEncoding error:NULL];
+    }
+    return ok;
+}
+
+- (NSArray<NSString *> *)detectedArchivePaths {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = [self documentsDirectory];
+    if (root.length == 0) return @[];
+
+    /*
+     * Both the firmware folder and Documents itself, because a user dropping a
+     * 239 MB file into "S5LBox" in Files is at least as likely as one who
+     * navigates into firmware/ first. Looking in the obvious place and the
+     * place we asked for costs one extra directory read.
+     */
+    NSArray<NSString *> *dirs = @[
+        [root stringByAppendingPathComponent:@"firmware"],
+        root,
+    ];
+    NSMutableArray<NSString *> *found = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (NSString *dir in dirs) {
+        NSArray<NSString *> *names =
+            [fm contentsOfDirectoryAtPath:dir error:NULL];
+        for (NSString *name in names) {
+            if (![name.pathExtension.lowercaseString isEqualToString:@"ipsw"])
+                continue;
+            NSString *path = [dir stringByAppendingPathComponent:name];
+            if ([seen containsObject:path]) continue;
+            [seen addObject:path];
+            [found addObject:path];
+        }
+    }
+
+    /* Newest first: the one just copied in is the one meant. */
+    [found sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSDate *da = [[fm attributesOfItemAtPath:a error:NULL] fileModificationDate];
+        NSDate *db = [[fm attributesOfItemAtPath:b error:NULL] fileModificationDate];
+        if (!da || !db) return NSOrderedSame;
+        return [db compare:da];
+    }];
+    return [found copy];
+}
+
+- (NSString *)firmwareDirectory {
+    /* Through -documentsDirectory, so this is the physically resolved path.
+     * Recomputing the raw one here is what put a /var symlink back into the
+     * path handed to rootfs_work.c. */
+    NSString *root = [self documentsDirectory];
+    if (root.length == 0) return nil;
+    return [VMFirmwareStore activeDirectoryInRoot:[root stringByAppendingPathComponent:@"firmware"]];
+}
+
+- (NSString *)firmwarePathForFile:(NSString *)file {
+    NSString *directory = [self firmwareDirectory];
+    if (!directory || file.length == 0) return nil;
+
+    NSString *path = [directory stringByAppendingPathComponent:file];
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path
+                                              isDirectory:&isDirectory])
+        return nil;
+    return isDirectory ? nil : path;
+}
+
+- (NSString *)statusForFirmwareFile:(NSString *)file {
+    NSString *path = [self firmwarePathForFile:file];
+    if (!path) return @"not supplied";
+
+    NSError *error = nil;
+    NSDictionary<NSFileAttributeKey, id> *attributes =
+        [[NSFileManager defaultManager] attributesOfItemAtPath:path error:&error];
+    NSNumber *size = attributes[NSFileSize];
+    if (![size isKindOfClass:[NSNumber class]]) return @"present, size unknown";
+
+    return [NSString stringWithFormat:@"present  ·  %@",
+            [NSByteCountFormatter stringFromByteCount:size.longLongValue
+                                           countStyle:NSByteCountFormatterCountStyleFile]];
+}
+
+#pragma mark - Housekeeping
+
+- (void)resetToDefaults {
+    NSUserDefaults *defaults = [self defaults];
+    for (unsigned i = 0; i < vm_option_count(); i++) {
+        NSString *key = [self keyForOptionIndex:i];
+        if (key) [defaults removeObjectForKey:key];
+    }
+    [defaults removeObjectForKey:kVMInstructionCapKey];
+    [defaults removeObjectForKey:kVMPauseInBackground];
+    [defaults removeObjectForKey:kVMLegacyEmulatorUI];
+    [defaults removeObjectForKey:kVMHomeOnlyEmulatorUI];
+    [defaults removeObjectForKey:kVMPackagesWithJailbreak];
+    [defaults removeObjectForKey:kVMAppSyncWithJailbreak];
+    [defaults removeObjectForKey:kVMGuestMicrophoneEnabled];
+    [defaults removeObjectForKey:kVMSkipFirmwareChecksums];
+    [defaults removeObjectForKey:kVMNewMachineDiskSizeGiB];
+    [self publishChange];
+}
+
+@end

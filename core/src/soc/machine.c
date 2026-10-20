@@ -1,0 +1,3031 @@
+/*
+ * S5LBox — S5L8900 machine: the system bus tying the CPU to RAM and devices.
+ *
+ * Every guest access lands here after MMU translation, and is routed by
+ * physical address to either RAM or a peripheral window. Accesses outside the
+ * map are counted rather than silently swallowed, so a misbehaving guest (or a
+ * gap in our memory map) is visible instead of mysterious.
+ *
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+ */
+#include "soc.h"
+#include "../arm/a64_static_engine.h"
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(S5LBOX_STATIC_A64_DEFAULT_GRAPH) && \
+    defined(S5LBOX_STATIC_A64_DEFAULT_COMPACT_RAW)
+#error "Only one signed-static A64 product policy may be selected"
+#endif
+
+/* ------------------------------------------------------- the window map ---
+ *
+ * Every window this machine decodes, in one place. It exists so that "is
+ * anything shadowed?" is a question with a single answer rather than a property
+ * that has to be re-derived from the if-chain in bus_read() every time someone
+ * changes the memory map — which is exactly how the NOR came to be unreachable
+ * at -R 512 without anyone noticing.
+ *
+ * NOR's size here is the constant rather than m->nor.size. They are always
+ * equal (s5l8900_init passes the constant), and using the constant is what lets
+ * s5l8900_ram_conflict() answer before a machine exists.
+ */
+static const s5l_window_t DEVICE_WINDOWS[] = {
+    { S5L8900_NOR_BASE,   S5L8900_NOR_SIZE,   "nor"   },
+    { S5L8900_CLCD_BASE,  S5L8900_DEV_SIZE,   "clcd"  },
+    { S5L8900_TVOUT_CTRL_BASE,  S5L_TVOUT_BANK_SIZE, "tvout-control" },
+    { S5L8900_TVOUT_MIXER_BASE, S5L_TVOUT_BANK_SIZE, "tvout-mixer"   },
+    { S5L8900_TVOUT_SDO_BASE,   S5L_TVOUT_BANK_SIZE, "tvout-sdo"     },
+    { S5L8900_MBX_BASE,   S5L_MBX_APERTURE,   "mbx"   },
+    { S5L8900_I2C0_BASE,  S5L8900_DEV_SIZE,   "i2c0"  },
+    { S5L8900_I2C1_BASE,  S5L8900_DEV_SIZE,   "i2c1"  },
+    /*
+     * The two I2S windows. Decoded rather than stubbed for the same reason
+     * uart4 is: run62's census shows zero traffic on either page, but "no
+     * traffic yet" is a statement about how far the boot got, not about the
+     * window. The codec's identify() fails before any transfer is configured,
+     * so the first writes to these pages are downstream of the WM8991 model
+     * that lands with them — which is precisely why the two are one change.
+     */
+    { S5L8900_I2S0_BASE,  S5L8900_DEV_SIZE,   "i2s0"  },
+    { S5L8900_I2S1_BASE,  S5L8900_DEV_SIZE,   "i2s1"  },
+    { S5L8900_SPI0_BASE,  S5L8900_DEV_SIZE,   "spi0"  },
+    { S5L8900_SPI1_BASE,  S5L8900_DEV_SIZE,   "spi1"  },
+    { S5L8900_USB_OTG_BASE, S5L8900_DEV_SIZE, "usb-otg" },
+    { S5L8900_VIC0_BASE,  S5L8900_DEV_SIZE,   "vic0"  },
+    { S5L8900_VIC1_BASE,  S5L8900_DEV_SIZE,   "vic1"  },
+    { S5L8900_POWER_BASE, S5L8900_POWER_SIZE, "power" },
+    /* The rest of the power page. Two blocks, two drivers, one page: see the
+     * GPIOIC section of soc.h for why the register offsets this window carries
+     * are stated relative to the page base rather than to this base. */
+    { S5L8900_GPIOIC_BASE, S5L8900_GPIOIC_SIZE, "gpioic" },
+    { S5L8900_GPIO_BASE,  S5L8900_DEV_SIZE,   "gpio"  },
+    { S5L8900_UART0_BASE, S5L8900_DEV_SIZE,   "uart0" },
+    /*
+     * uart4, the PPP line. Decoded unconditionally rather than behind the
+     * harness toggle that provisions the guest job, and that is deliberate:
+     * the toggle decides whether anything TALKS to this port, never whether
+     * the port answers correctly. A window that appears and disappears with a
+     * command-line flag would make every recorded MMIO census conditional on
+     * it, and the run that has the flag off is exactly the run that proves the
+     * port is quiet.
+     *
+     * Before this entry existed the page was not merely unmodelled, it was
+     * undeclared: run59's census recorded `0x3cc10000 r=8 w=15` falling
+     * through to the unmapped path, so every UTRSTAT read answered 0 — i.e.
+     * "transmitter busy" — and any driver that waited for room before writing
+     * would have waited forever. Decoding the window is what makes the
+     * transmit path terminate at all.
+     */
+    { S5L8900_UART4_BASE, S5L8900_DEV_SIZE,   "uart4" },
+    { S5L8900_TIMER_BASE, S5L8900_TIMER_SIZE, "timer" },
+    { S5L8900_WDT_BASE,   S5L8900_DEV_SIZE,   "wdt"   },
+    /*
+     * The two PL080 DMA controllers. Neither page was decoded or even declared
+     * before, so AppleARMPL080DMAC::start mapped it, printed a base address,
+     * initialised ten channels into it and had every one of those writes
+     * discarded — including the two the device tree points at the I2S FIFOs.
+     * See the PL080 block in soc.h for the whole derivation.
+     */
+    { S5L8900_DMAC0_BASE, S5L8900_DEV_SIZE,   "dmac0" },
+    { S5L8900_DMAC1_BASE, S5L8900_DEV_SIZE,   "dmac1" },
+};
+#define NDEVICE_WINDOWS (sizeof DEVICE_WINDOWS / sizeof DEVICE_WINDOWS[0])
+
+/*
+ * Physical regions the SoC has, from the shipped device tree. Modelled or not:
+ * the point of listing the unmodelled ones is that an oversized DRAM window
+ * covering them is a stated property of the configuration, not folklore. See
+ * the memory-map block at the top of soc.h for the derivation of each.
+ */
+static const s5l_window_t SOC_REGIONS[] = {
+    { S5L8900_SDRAM_BASE, 0x08000000u,        "dram (128 MB fitted)" },
+    { S5L8900_EDRAM_BASE, S5L8900_EDRAM_SIZE, "edram"                },
+    { S5L8900_VROM_BASE,  S5L8900_VROM_SIZE,  "vrom"                 },
+    { S5L8900_SRAM_BASE,  S5L8900_SRAM_SIZE,  "sram/amc"             },
+    { S5L8900_ARMIO_BASE, S5L8900_ARMIO_SIZE, "arm-io"               },
+};
+
+bool s5l8900_overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen) {
+    /* 64-bit throughout: a window near the top of the space must not wrap its
+     * end below its base and read as disjoint from everything. */
+    uint64_t a0 = a, a1 = a0 + alen;
+    uint64_t b0 = b, b1 = b0 + blen;
+    if (!alen || !blen) return false;
+    return b0 < a1 && a0 < b1;
+}
+
+unsigned s5l8900_soc_regions(const s5l_window_t **out) {
+    if (out) *out = SOC_REGIONS;
+    return (unsigned)(sizeof SOC_REGIONS / sizeof SOC_REGIONS[0]);
+}
+
+const s5l_window_t *s5l8900_ram_conflict(uint32_t ram_base, uint32_t ram_size) {
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++)
+        if (s5l8900_overlaps(ram_base, ram_size,
+                             DEVICE_WINDOWS[i].base, DEVICE_WINDOWS[i].size))
+            return &DEVICE_WINDOWS[i];
+    return NULL;
+}
+
+unsigned s5l8900_windows(const s5l8900_t *m, s5l_window_t *out, unsigned max) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++, n++)
+        if (out && n < max) out[n] = DEVICE_WINDOWS[i];
+    for (unsigned i = 0; i < m->stub_count; i++, n++)
+        if (out && n < max) {
+            out[n].base = m->stubs[i].base;
+            out[n].size = m->stubs[i].size;
+            out[n].name = m->stubs[i].name;
+        }
+    return n;
+}
+
+/*
+ * Bounds checks are done in 64-bit deliberately. The guest controls every
+ * address, so a 32-bit "(a - base) + len <= size" can be made to wrap: an
+ * access at 0xFFFFFFFE with len 4 sums to 2, passes the test, and then indexes
+ * ram[0xFFFFFFFE]. Widening makes that impossible.
+ */
+static inline bool in_ram(const s5l8900_t *m, uint32_t a, uint32_t len) {
+    if (a < m->ram_base) return false;
+    return (uint64_t)(a - m->ram_base) + (uint64_t)len <= (uint64_t)m->ram_size;
+}
+static inline bool in_window(uint32_t a, unsigned bytes,
+                             uint32_t base, uint32_t size) {
+    if (!bytes || a < base) return false;
+    return (uint64_t)(a - base) + bytes <= (uint64_t)size;
+}
+static inline bool in_dev(uint32_t a, unsigned bytes, uint32_t base) {
+    return in_window(a, bytes, base, S5L8900_DEV_SIZE);
+}
+static inline bool mmio_word(uint32_t a, unsigned bytes,
+                             uint32_t base, uint32_t size) {
+    return bytes == 4u && (a & 3u) == 0u && in_window(a, bytes, base, size);
+}
+/*
+ * THE DATA PORTS: SPI and I2S, which are DMA destinations and therefore see
+ * accesses NARROWER THAN A WORD.
+ *
+ * mmio_word() demands bytes == 4, and for a control register that is right --
+ * the CPU only ever reads and writes those a word at a time, and admitting a
+ * narrow access would hide a guest doing something surprising. But a DMA
+ * destination is not a control register. /arm-io/spi1's own dma-channels
+ * template is 0x00089000: four-byte source, ONE-BYTE destination. So the DMAC
+ * issues write8, mmio_word() rejects every one of them, and they fall past
+ * every device to m->unmapped_writes.
+ *
+ * That was not theoretical. run114 measured the Z2 firmware download landing
+ * there in full: channel 5, destination 0x3ce00010 which is SPI1's TXDATA,
+ * `runs 210 bytes 812340` -- against `spi1 words 176, tx-drops 0`, and
+ * `unmapped writes 813135` with 0x3ce00000 named in the outside-the-map list.
+ * The controller did its work, the port never heard a byte of it, and the
+ * digitizer has been echoing its idle pattern ever since. Every explanation
+ * this project wrote for that -- and there were several -- looked at the guest.
+ *
+ * Natural alignment rather than word alignment, because that is what the width
+ * means. An offset this device does not decode still reaches its own switch and
+ * is counted there, so a surprising access is visible rather than dropped.
+ */
+static inline bool mmio_data(uint32_t a, unsigned bytes,
+                             uint32_t base, uint32_t size) {
+    return (bytes == 1u || bytes == 2u || bytes == 4u) &&
+           (a & (bytes - 1u)) == 0u && in_window(a, bytes, base, size);
+}
+/* The timer is the one peripheral that does not fit the uniform 4 KB window:
+ * its interrupt-status alias sits at offset 0x10000. */
+static inline bool in_power(uint32_t a, unsigned bytes) {
+    return mmio_word(a, bytes, S5L8900_POWER_BASE, S5L8900_POWER_SIZE);
+}
+static inline bool in_mbx(uint32_t a, unsigned bytes) {
+    return mmio_word(a, bytes, S5L8900_MBX_BASE, S5L_MBX_APERTURE);
+}
+static inline bool in_gpioic(uint32_t a, unsigned bytes) {
+    return mmio_word(a, bytes, S5L8900_GPIOIC_BASE, S5L8900_GPIOIC_SIZE);
+}
+static inline bool in_timer(uint32_t a, unsigned bytes) {
+    return mmio_word(a, bytes, S5L8900_TIMER_BASE, S5L8900_TIMER_SIZE);
+}
+
+/* ------------------------------------------------------- stub windows --- */
+
+bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
+                      const char *name) {
+    if (!m || m->stub_count >= S5L_STUB_MAX || !size) return false;
+    /* A window that extends beyond the 32-bit physical address space is only
+     * partially reachable and used to make the rounded register count wrap. */
+    if ((uint64_t)base + size > 0x100000000ull) return false;
+    /*
+     * Refuse to shadow, or be shadowed by, anything already on the bus: a
+     * modelled device, another stub, or RAM. A stub that quietly overlays a
+     * real device model would be far harder to notice than a rejected call —
+     * and a stub inside the RAM aperture would be unreachable, because RAM is
+     * on the fast path (see the routing contract in soc.h).
+     */
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++)
+        if (s5l8900_overlaps(base, size,
+                             DEVICE_WINDOWS[i].base, DEVICE_WINDOWS[i].size))
+            return false;
+    for (unsigned i = 0; i < m->stub_count; i++)
+        if (s5l8900_overlaps(base, size, m->stubs[i].base, m->stubs[i].size))
+            return false;
+    if (s5l8900_overlaps(base, size, m->ram_base, m->ram_size)) return false;
+    uint64_t nregs64 = ((uint64_t)size + 3u) / 4u;
+    if (nregs64 > 0xffffffffu ||
+        nregs64 > (uint64_t)SIZE_MAX / sizeof(uint32_t)) return false;
+    uint32_t nregs = (uint32_t)nregs64;
+    uint32_t *regs = calloc((size_t)nregs, sizeof *regs);
+    if (!regs) return false;
+
+    s5l_stub_t *s = &m->stubs[m->stub_count++];
+    memset(s, 0, sizeof *s);
+    s->base = base; s->size = size; s->name = name;
+    s->regs = regs; s->nregs = nregs;
+    return true;
+}
+
+static s5l_stub_t *find_stub(s5l8900_t *m, uint32_t a, unsigned bytes) {
+    for (unsigned i = 0; i < m->stub_count; i++)
+        if (in_window(a, bytes, m->stubs[i].base, m->stubs[i].size))
+            return &m->stubs[i];
+    return NULL;
+}
+
+/* Stub windows are honest byte-addressable storage. Assemble accesses a byte
+ * at a time so 8/16-bit and unaligned transactions update the correct lanes
+ * without ever indexing beyond the rounded backing-register array. */
+static uint32_t stub_read(const s5l_stub_t *s, uint32_t addr, unsigned bytes) {
+    uint32_t v = 0;
+    uint32_t rel = addr - s->base;
+    for (unsigned i = 0; i < bytes; i++) {
+        uint32_t at = rel + i;
+        uint32_t byte = (s->regs[at >> 2] >> ((at & 3u) * 8u)) & 0xffu;
+        v |= byte << (i * 8u);
+    }
+    return v;
+}
+
+static void stub_write(s5l_stub_t *s, uint32_t addr,
+                       uint32_t val, unsigned bytes) {
+    uint32_t rel = addr - s->base;
+    for (unsigned i = 0; i < bytes; i++) {
+        uint32_t at = rel + i;
+        uint32_t shift = (at & 3u) * 8u;
+        uint32_t *reg = &s->regs[at >> 2];
+        *reg = (*reg & ~(0xffu << shift)) |
+               (((val >> (i * 8u)) & 0xffu) << shift);
+    }
+}
+
+/* ------------------------------------------------------------- reads --- */
+
+/* Record the first distinct out-of-map addresses so a wandering guest tells us
+ * which peripheral is missing rather than leaving us to guess. */
+static void note_unmapped(s5l8900_t *m, uint32_t addr) {
+    uint32_t page = addr & ~0xfffu;
+    for (unsigned i = 0; i < m->unmapped_addr_count; i++)
+        if (m->unmapped_addr[i] == page) return;
+    if (m->unmapped_addr_count < S5L_UNMAPPED_LOG)
+        m->unmapped_addr[m->unmapped_addr_count++] = page;
+}
+
+static void note_device(s5l8900_t *m, uint32_t addr, uint32_t val, bool is_write) {
+    if (!m->trace_devices || m->dev_count >= S5L_DEVLOG) return;
+    m->dev_addr[m->dev_count]     = addr;
+    m->dev_value[m->dev_count]    = val;
+    m->dev_is_write[m->dev_count] = is_write;
+    m->dev_count++;
+}
+
+/*
+ * RAM is tested first, and that is safe ONLY because s5l8900_init() has already
+ * refused to build a machine whose RAM aperture overlaps a device window (and
+ * s5l8900_add_stub() refuses a window inside RAM). Under that invariant "RAM
+ * first" and "device first" route identically, so the cheap test can go first.
+ *
+ * Do not relax the invariant and leave this ordering. It used to be the case
+ * that RAM won by accident rather than by proof, and at -R 512 the DRAM window
+ * reached 0x28000000 and swallowed the NOR: every NOR read returned RAM-disk
+ * bytes, no fault, no log, nothing to find.
+ */
+/*
+ * A host pointer for a physical range, but ONLY when it is plain DRAM.
+ *
+ * The caller uses this to turn a translation into a pointer once and reuse it,
+ * skipping the indirect bus call, the range check and the variable-size memcpy
+ * that a fetch otherwise pays on every instruction. Returning NULL is always
+ * correct and simply keeps it on the slow path.
+ *
+ * in_ram() is the same predicate bus_read uses, and it is deliberately reused
+ * rather than restated: it already widens to 64 bits so a length that would
+ * wrap a 32-bit sum cannot pass. Anything that is not DRAM -- MMIO, NOR, a
+ * stub window, or a range running off the end -- gets NULL, which is what
+ * keeps device semantics on the path that models them.
+ */
+static uint8_t *machine_host_ram(void *ctx, uint32_t pa, uint32_t len) {
+    s5l8900_t *m = ctx;
+    if (!m || !m->ram || !len) return NULL;
+    if (!in_ram(m, pa, len)) return NULL;
+    return m->ram + (pa - m->ram_base);
+}
+
+static uint8_t *machine_watched_ram_write(void *ctx, uint32_t pa, uint32_t len) {
+    s5l8900_t *m = ctx;
+    /* A reusable whole-window grant cannot express subsequently watched
+     * pages. Individual DWRITE/graphics grants remain revocable and bounded. */
+    if (!m || (pa == m->ram_base && len == m->ram_size) ||
+        !arm_ram_watch_unwatched(m->ram_watch, pa, len)) return NULL;
+    return machine_host_ram(ctx, pa, len);
+}
+
+void s5l8900_ram_changed(void *machine, uint32_t pa, uint32_t length) {
+    s5l8900_t *m = machine;
+    if (m) arm_ram_watch_changed(m->ram_watch, pa, length);
+}
+
+static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
+    s5l8900_t *m = ctx;
+
+    if (in_ram(m, addr, bytes)) {
+        uint32_t v = 0;
+        memcpy(&v, &m->ram[addr - m->ram_base], bytes);   /* little-endian host */
+        return v;
+    }
+    /*
+     * Past the RAM aperture is a device, and this is the ONE place every guest
+     * device access passes through — which is what makes `level_dirty` a
+     * complete account of guest-caused level changes rather than a list of
+     * windows somebody has to remember to extend. Set on reads as well as
+     * writes: draining URXH, popping the SPI receive FIFO and reading
+     * VICADDRESS all change what a line asserts, and nine of the fifteen read
+     * entry points take a non-const device pointer. Distinguishing the pure
+     * ones would buy a store per MMIO read and cost the guarantee.
+     */
+    m->level_dirty = true;
+    uint32_t v;
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
+        in_dev(addr, bytes, S5L8900_UART0_BASE)) {
+        v = s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
+               in_dev(addr, bytes, S5L8900_UART4_BASE)) {
+        /* Same access widths as uart0's, for the same reason: the console
+         * driver reaches this register file with byte, halfword and word
+         * loads, and the two ports run the same driver. */
+        uint32_t off = addr - S5L8900_UART4_BASE;
+        unsigned rx_before = m->uart4.rx_count;
+        v = s5l_uart_read(&m->uart4, off);
+        /* A PIO receive handler snapshots a finite FIFO count, then hands that
+         * batch to the tty layer. Refilling synchronously after each PIO read
+         * kept the RX cause continuously active across handler entries, faster
+         * than the tty software queue could absorb it; the physical guest then
+         * printed "Software Overflow" and lost PPP bytes. A PL080 command is
+         * different: its programmed transfer count is a hard batch boundary,
+         * so demand refill is both bounded and required to let one command
+         * consume beyond the initially visible FIFO. */
+        if (off == UART_URXH && m->uart4.rx_count < rx_before &&
+            m->dma_access_active && m->uart4_host_refill)
+            m->uart4_host_refill(m->uart4_host_ctx);
+    } else if (mmio_word(addr, bytes, S5L8900_VIC0_BASE, S5L8900_DEV_SIZE)) {
+        uint32_t off = addr - S5L8900_VIC0_BASE;
+        /* VIC0's VICADDRESS surfaces its own sources first, then daisy-chains
+         * to VIC1 (global sources 32-63) — the standard PL192 cascade, and how
+         * the driver reads a single global 0-63 source number from VIC0. */
+        if (off == VIC_VECTADDR) {
+            v = s5l_vic_vectaddr(&m->vic[0], 0);
+            if (!v) v = s5l_vic_vectaddr(&m->vic[1], 32);
+        } else {
+            v = s5l_vic_read(&m->vic[0], off);
+        }
+    } else if (mmio_word(addr, bytes, S5L8900_VIC1_BASE, S5L8900_DEV_SIZE)) {
+        uint32_t off = addr - S5L8900_VIC1_BASE;
+        if (off == VIC_VECTADDR) v = s5l_vic_vectaddr(&m->vic[1], 32);
+        else                     v = s5l_vic_read(&m->vic[1], off);
+    } else if (mmio_word(addr, bytes, S5L8900_CLCD_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_clcd_read(&m->clcd, addr - S5L8900_CLCD_BASE);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_TVOUT_CTRL_BASE,
+                         S5L_TVOUT_BANK_SIZE)) {
+        v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_CTRL,
+                           addr - S5L8900_TVOUT_CTRL_BASE, bytes);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_TVOUT_MIXER_BASE,
+                         S5L_TVOUT_BANK_SIZE)) {
+        v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_MIXER,
+                           addr - S5L8900_TVOUT_MIXER_BASE, bytes);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_TVOUT_SDO_BASE,
+                         S5L_TVOUT_BANK_SIZE)) {
+        v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_SDO,
+                           addr - S5L8900_TVOUT_SDO_BASE, bytes);
+    } else if (in_timer(addr, bytes)) {
+        v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
+    } else if (mmio_word(addr, bytes, S5L8900_WDT_BASE,
+                         S5L8900_DEV_SIZE)) {
+        /* The shipped driver's reached path only stores. Zero preserves the
+         * old unmapped read value without leaving the page undeclared. */
+        v = 0u;
+    } else if (in_power(addr, bytes)) {
+        v = s5l_power_read(&m->power, addr - S5L8900_POWER_BASE);
+    } else if (in_mbx(addr, bytes)) {
+        v = s5l_mbx_read(&m->mbx, addr - S5L8900_MBX_BASE);
+    } else if (in_gpioic(addr, bytes)) {
+        /* Offset from the PAGE, not from the window: the driver's own
+         * 0x80/0xA0/0xC0/0xE0 are page-relative and rebasing them onto the
+         * window would silently shift the whole map by 0x80. */
+        v = s5l_gpioic_read(&m->gpioic, addr - S5L8900_GPIOIC_PAGE);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_dev(addr, bytes, S5L8900_GPIO_BASE)) {
+        v = s5l_gpio_read(&m->gpio, addr - S5L8900_GPIO_BASE, bytes);
+    } else if (mmio_word(addr, bytes, S5L8900_I2C0_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_i2c_read(&m->i2c[0], addr - S5L8900_I2C0_BASE);
+    } else if (mmio_word(addr, bytes, S5L8900_I2C1_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_i2c_read(&m->i2c[1], addr - S5L8900_I2C1_BASE);
+    } else if (mmio_data(addr, bytes, S5L8900_I2S0_BASE, S5L8900_DEV_SIZE)) {
+        /* Word accesses only, as for the I2C controllers: the stock accessors
+         * are a bare `ldr`/`str` of a 32-bit word at a byte offset. */
+        v = s5l_i2s_read_width(&m->i2s[0], addr - S5L8900_I2S0_BASE, bytes);
+    } else if (mmio_data(addr, bytes, S5L8900_I2S1_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_i2s_read(&m->i2s[1], addr - S5L8900_I2S1_BASE);
+    } else if (mmio_data(addr, bytes, S5L8900_SPI0_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_spi_read(&m->spi[0], addr - S5L8900_SPI0_BASE);
+    } else if (mmio_data(addr, bytes, S5L8900_SPI1_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_spi_read(&m->spi[1], addr - S5L8900_SPI1_BASE);
+    } else if (mmio_word(addr, bytes, S5L8900_USB_OTG_BASE, S5L8900_DEV_SIZE)) {
+        /* Word accesses only, as for the VICs, the CLCD and the I2C
+         * controllers. The driver uses 32-bit accessors throughout; a narrower
+         * or unaligned access to this page stays unmapped-and-counted rather
+         * than being answered with a fabricated lane. */
+        v = s5l_usbotg_read(&m->usbotg, addr - S5L8900_USB_OTG_BASE);
+    } else if (mmio_word(addr, bytes, S5L8900_DMAC0_BASE, S5L8900_DEV_SIZE)) {
+        /* Word accesses only: AppleARMPL080DMAC reaches this file through one
+         * `ldr r0,[off, base]` at 0xc070ecd4 and one `str r2,[off, base]` at
+         * 0xc070ed08, both 32-bit. */
+        v = s5l_pl080_read(&m->dmac[0], addr - S5L8900_DMAC0_BASE);
+    } else if (mmio_word(addr, bytes, S5L8900_DMAC1_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_pl080_read(&m->dmac[1], addr - S5L8900_DMAC1_BASE);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_NOR_BASE, m->nor.size)) {
+        v = s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
+    } else {
+        s5l_stub_t *s = find_stub(m, addr, bytes);
+        if (!s) {
+            m->unmapped_reads++;
+            note_unmapped(m, addr);
+            note_device(m, addr, 0, false);
+            return 0;
+        }
+        s->reads++;
+        v = stub_read(s, addr, bytes);
+    }
+    note_device(m, addr, v, false);
+    return v;
+}
+
+static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
+    s5l8900_t *m = ctx;
+
+    if (in_ram(m, addr, bytes)) {
+        s5l8900_ram_changed(m, addr, bytes);
+        memcpy(&m->ram[addr - m->ram_base], &val, bytes);
+        return;
+    }
+    m->level_dirty = true;      /* a device store; see bus_read() */
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
+        in_dev(addr, bytes, S5L8900_UART0_BASE)) {
+        uint32_t off = addr - S5L8900_UART0_BASE;
+        note_device(m, addr, val, true);
+        /* uart4's DMA transmit endpoint is uart0 UTXH in the shipped tree.
+         * Ordinary uart0 writes remain the kernel console and never enter
+         * PPP; only the PL080-owned access is the logical uart4 stream. Keep
+         * its capture with uart4 too, or megabytes of framed PPP would appear
+         * as garbage in the console merely because the hardware endpoint is
+         * crossed. */
+        if (m->dma_access_active && off == UART_UTXH) {
+            s5l_uart_write(&m->uart4, off, val);
+            if (m->uart4_host_tx)
+                m->uart4_host_tx(m->uart4_host_ctx, (uint8_t)val);
+        } else {
+            s5l_uart_write(&m->uart0, off, val);
+            if (off == UART_UTXH && m->uart0_host_tx)
+                m->uart0_host_tx(m->uart0_host_ctx, (uint8_t)val);
+        }
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
+        in_dev(addr, bytes, S5L8900_UART4_BASE)) {
+        note_device(m, addr, val, true);
+        uint32_t off = addr - S5L8900_UART4_BASE;
+        /* PIO uart4 writes are PPP. A PL080 write here is uart0's crossed DMA
+         * endpoint and must not splice console traffic into the PPP peer. Keep
+         * that byte in uart0's capture for the same logical-routing reason. */
+        if (m->dma_access_active && off == UART_UTXH) {
+            s5l_uart_write(&m->uart0, off, val);
+            if (off == UART_UTXH && m->uart0_host_tx)
+                m->uart0_host_tx(m->uart0_host_ctx, (uint8_t)val);
+        } else {
+            s5l_uart_write(&m->uart4, off, val);
+            if (off == UART_UTXH && m->uart4_host_tx)
+                m->uart4_host_tx(m->uart4_host_ctx, (uint8_t)val);
+        }
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_VIC0_BASE, S5L8900_DEV_SIZE)) {
+        s5l_vic_write(&m->vic[0], addr - S5L8900_VIC0_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_VIC1_BASE, S5L8900_DEV_SIZE)) {
+        s5l_vic_write(&m->vic[1], addr - S5L8900_VIC1_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_CLCD_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_clcd_write(&m->clcd, addr - S5L8900_CLCD_BASE, val);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_TVOUT_CTRL_BASE,
+                  S5L_TVOUT_BANK_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_tvout_write(&m->tvout, S5L_TVOUT_BANK_CTRL,
+                        addr - S5L8900_TVOUT_CTRL_BASE, val, bytes);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_TVOUT_MIXER_BASE,
+                  S5L_TVOUT_BANK_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_tvout_write(&m->tvout, S5L_TVOUT_BANK_MIXER,
+                        addr - S5L8900_TVOUT_MIXER_BASE, val, bytes);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_TVOUT_SDO_BASE,
+                  S5L_TVOUT_BANK_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_tvout_write(&m->tvout, S5L_TVOUT_BANK_SDO,
+                        addr - S5L8900_TVOUT_SDO_BASE, val, bytes);
+        return;
+    }
+    if (in_timer(addr, bytes)) {
+        s5l_timer_write(&m->timer, addr - S5L8900_TIMER_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_WDT_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        if (addr == S5L8900_WDT_BASE &&
+            val == S5L8900_WDT_RESTART_VALUE)
+            m->restart_requested = true;
+        return;
+    }
+    if (in_power(addr, bytes)) {
+        note_device(m, addr, val, true);
+        s5l_power_write(&m->power, addr - S5L8900_POWER_BASE, val);
+        return;
+    }
+    if (in_mbx(addr, bytes)) {
+        note_device(m, addr, val, true);
+        uint32_t off = addr - S5L8900_MBX_BASE;
+        (void)s5l_mbx_stage_ta_write(&m->mbx, &m->bus, off, val);
+        s5l_mbx_write(&m->mbx, off, val);
+        /* The MBX owns its register/EDRAM aperture; the machine owns DRAM and
+         * the observer-aware bus. Keep that ownership boundary explicit. */
+        (void)s5l_mbx_process_2d(&m->mbx, &m->bus, off, val,
+                                 &m->mbx_telemetry);
+        (void)s5l_mbx_process_3d(&m->mbx, &m->bus, off, val,
+                                 &m->mbx_telemetry);
+        return;
+    }
+    if (in_gpioic(addr, bytes)) {
+        note_device(m, addr, val, true);
+        s5l_gpioic_write(&m->gpioic, addr - S5L8900_GPIOIC_PAGE, val);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_dev(addr, bytes, S5L8900_GPIO_BASE)) {
+        note_device(m, addr, val, true);
+        s5l_gpio_write(&m->gpio, addr - S5L8900_GPIO_BASE, val, bytes);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_I2C0_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_i2c_write(&m->i2c[0], addr - S5L8900_I2C0_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_I2C1_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_i2c_write(&m->i2c[1], addr - S5L8900_I2C1_BASE, val);
+        return;
+    }
+    if (mmio_data(addr, bytes, S5L8900_I2S0_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_i2s_write_width(&m->i2s[0], addr - S5L8900_I2S0_BASE, val, bytes);
+        return;
+    }
+    if (mmio_data(addr, bytes, S5L8900_I2S1_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_i2s_write(&m->i2s[1], addr - S5L8900_I2S1_BASE, val);
+        return;
+    }
+    if (mmio_data(addr, bytes, S5L8900_SPI0_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_spi_write(&m->spi[0], addr - S5L8900_SPI0_BASE, val);
+        return;
+    }
+    if (mmio_data(addr, bytes, S5L8900_SPI1_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_spi_write(&m->spi[1], addr - S5L8900_SPI1_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_USB_OTG_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_usbotg_write(&m->usbotg, addr - S5L8900_USB_OTG_BASE, val);
+        return;
+    }
+    /*
+     * The DMACs. The store is recorded and applied here; NOTHING is transferred
+     * from inside it. A channel enabled by this store moves its bytes in
+     * s5l_pl080_run(), which s5l8900_tick() calls — see the comment at the top
+     * of pl080.c for why the bus is never re-entered from a bus write.
+     */
+    if (mmio_word(addr, bytes, S5L8900_DMAC0_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_pl080_write(&m->dmac[0], addr - S5L8900_DMAC0_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_DMAC1_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_pl080_write(&m->dmac[1], addr - S5L8900_DMAC1_BASE, val);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_NOR_BASE, m->nor.size)) {
+        /* Guest writes program the flash (bits can only be cleared). Note this
+         * is a simplification: on real hardware the NOR is SPI-attached and is
+         * programmed through controller commands rather than by storing to a
+         * memory window. Modelling it as a direct write keeps the path a guest
+         * payload needs — persisting itself into NOR, as an untethered
+         * jailbreak does — without a full SPI protocol model. */
+        s5l_nor_write(&m->nor, addr - S5L8900_NOR_BASE, val, bytes);
+        return;
+    }
+    {
+        s5l_stub_t *s = find_stub(m, addr, bytes);
+        if (s) {
+            s->writes++;
+            note_device(m, addr, val, true);
+            stub_write(s, addr, val, bytes);
+            return;
+        }
+    }
+    m->unmapped_writes++;
+    note_unmapped(m, addr);
+    note_device(m, addr, val, true);
+}
+
+static uint32_t r32(void *c, uint32_t a) { return bus_read(c, a, 4); }
+static uint16_t r16(void *c, uint32_t a) { return (uint16_t)bus_read(c, a, 2); }
+static uint8_t  r8 (void *c, uint32_t a) { return (uint8_t) bus_read(c, a, 1); }
+/*
+ * THE DMA REQUEST LINE, which this machine answers on its peripherals' behalf.
+ *
+ * A PL080 moves a burst into a peripheral only when that peripheral asks for
+ * one. This model has no request wires, and until run116 it did not need them:
+ * narrow stores to the two data ports were being dropped by the bus decode, so
+ * nothing ever arrived fast enough to overflow anything.
+ *
+ * With that fixed the controller delivered a whole 54,156-byte Z2 firmware
+ * image into an eight-deep transmit FIFO inside a single tick, before the
+ * driver had armed the port -- `tx-drops 54140`. Real hardware cannot do that,
+ * because the SPI only raises its request when it has room.
+ *
+ * SPI transmit space and UART/SPI receive availability are gated. Everything
+ * else -- memory, control registers, devices with no modelled FIFO -- is always
+ * ready, which preserves the behaviour every existing test was written against.
+ */
+static bool dma_request_ready(void *ctx, uint32_t address, unsigned width,
+                              bool source) {
+    s5l8900_t *m = ctx;
+    if (address == S5L8900_I2S0_BASE +
+        (source ? S5L_I2S_RX_FIFO_OFF : S5L_I2S_TX_FIFO_OFF))
+        return s5l_i2s_dma_ready(&m->i2s[0], width, source);
+    if (source) {
+        if (address == S5L8900_UART0_BASE + UART_URXH)
+            return s5l_uart_rx_dma_ready(&m->uart0);
+        if (address == S5L8900_UART4_BASE + UART_URXH) {
+            if (s5l_uart_rx_dma_ready(&m->uart4)) return true;
+            /* The serial clock is collapsed, but not its ordering. An initial
+             * short host batch is already idle; after DMA has crossed the
+             * watermark, each preceding URXH read also gave the host peer one
+             * bounded refill opportunity. Fire the armed timeout and grant the
+             * request so PL080 consumes that finite tail in the same run. */
+            return s5l_uart_rx_dma_idle(&m->uart4);
+        }
+        for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) {
+            static const uint32_t base[] = {
+                S5L8900_SPI0_BASE, S5L8900_SPI1_BASE, S5L8900_SPI2_BASE
+            };
+            if (i >= sizeof base / sizeof base[0]) break;
+            if (address == base[i] + SPI_RXDATA)
+                return m->spi[i].rx_level != 0u;
+        }
+        return true;
+    }
+    for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) {
+        static const uint32_t base[] = {
+            S5L8900_SPI0_BASE, S5L8900_SPI1_BASE, S5L8900_SPI2_BASE
+        };
+        if (i >= sizeof base / sizeof base[0]) break;
+        if (address == base[i] + SPI_TXDATA)
+            return m->spi[i].tx_level < S5L_SPI_FIFO_DEPTH;
+    }
+    return true;
+}
+
+static void w32(void *c, uint32_t a, uint32_t v) { bus_write(c, a, v, 4); }
+static void w16(void *c, uint32_t a, uint16_t v) { bus_write(c, a, v, 2); }
+static void w8 (void *c, uint32_t a, uint8_t  v) { bus_write(c, a, v, 1); }
+
+static void active_clock_reset_anchor(s5l8900_t *m);
+static void active_clock_counter_add(uint64_t *counter, uint64_t value);
+
+bool s5l8900_set_direct_ram_writes(s5l8900_t *m, bool enabled) {
+    if (!m) return false;
+    if (enabled &&
+        (m->bus.ctx != m || m->cpu.bus != &m->bus ||
+         m->bus.write32 != w32 || m->bus.write16 != w16 ||
+         m->bus.write8 != w8 || m->bus.host_ram != machine_host_ram)) {
+        /* Fail closed even if a caller asks to re-enable after installing an
+         * interposer without first revoking an earlier grant. The interposer
+         * still owns the ordering contract, but this API must never make that
+         * mistake persist once it can see it. */
+        m->bus.host_ram_write = NULL;
+        memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
+        return false;
+    }
+    m->bus.host_ram_write = enabled ?
+        (m->ram_watch ? machine_watched_ram_write : machine_host_ram) : NULL;
+    /* A pointer granted under an earlier frontend contract must never survive
+     * a mode change. Generation tags cannot express revoked consent. */
+    memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
+    return true;
+}
+
+arm_ram_watch_t *s5l8900_ram_watch_current(const s5l8900_t *m) {
+    if (!m || !m->ram_watch || m->cpu.bus != &m->bus || m->bus.ctx != m ||
+        m->bus.read32 != r32 || m->bus.read16 != r16 || m->bus.read8 != r8 ||
+        m->bus.write32 != w32 || m->bus.write16 != w16 || m->bus.write8 != w8 ||
+        m->bus.host_ram != machine_host_ram ||
+        (m->bus.host_ram_write && m->bus.host_ram_write != machine_watched_ram_write))
+        return NULL;
+    return m->ram_watch;
+}
+
+bool s5l8900_set_ram_watch(s5l8900_t *m, bool enabled) {
+    if (!m) return false;
+    if (enabled) {
+        if (m->ram_watch) return s5l8900_ram_watch_current(m) != NULL;
+        if (m->cpu.bus != &m->bus || m->bus.ctx != m ||
+            m->bus.read32 != r32 || m->bus.read16 != r16 || m->bus.read8 != r8 ||
+            m->bus.write32 != w32 || m->bus.write16 != w16 || m->bus.write8 != w8 ||
+            m->bus.host_ram != machine_host_ram ||
+            (m->bus.host_ram_write && m->bus.host_ram_write != machine_host_ram))
+            return false;
+        m->ram_watch = arm_ram_watch_create(m->ram, m->ram_base, m->ram_size);
+        if (!m->ram_watch) return false;
+        if (m->bus.host_ram_write) m->bus.host_ram_write = machine_watched_ram_write;
+    } else {
+        arm_ram_watch_destroy(m->ram_watch);
+        m->ram_watch = NULL;
+        if (m->bus.host_ram_write == machine_watched_ram_write)
+            m->bus.host_ram_write = machine_host_ram;
+    }
+    memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
+    s5l8900_static_a64_invalidate_derived(m);
+    return true;
+}
+
+bool s5l8900_set_wfi_host_pacing(s5l8900_t *m,
+                                 s5l_wfi_host_sleep_fn sleep, void *ctx) {
+    if (!m) return false;
+    if (!sleep && ctx) return false;
+
+    /* Publish the callback last when enabling and clear it first when
+     * disabling. The machine is single-owner, but this ordering also prevents
+     * a diagnostic observer from ever seeing a live callback with stale
+     * context. */
+    if (!sleep) m->wfi_host_sleep = NULL;
+    m->wfi_host_sleep_ctx = sleep ? ctx : NULL;
+    m->wfi_paced_waits = 0u;
+    m->wfi_paced_wait_ns = 0u;
+    m->wfi_paced_partial_advances = 0u;
+    m->wfi_paced_failures = 0u;
+    m->wfi_pace_yield = false;
+    m->power_wait_fraction = 0u;
+    m->active_clock_idle_oversleep_ns = 0u;
+    m->active_clock_idle_credit_ticks = 0u;
+    m->active_clock_idle_repaid_ticks = 0u;
+    if (sleep) m->wfi_host_sleep = sleep;
+    return true;
+}
+
+bool s5l8900_set_active_host_clock(s5l8900_t *m,
+                                   s5l_active_host_now_fn now, void *ctx) {
+    if (!m) return false;
+    if (!now && ctx) return false;
+
+    /* Match the WFI policy's publication order: a diagnostic observer cannot
+     * see a live callback paired with stale context or anchor state. */
+    if (!now) m->active_host_now = NULL;
+    m->active_host_now_ctx = now ? ctx : NULL;
+    m->active_clock_last_host_ns = 0u;
+    m->active_clock_guest_ticks_since_sync = 0u;
+    m->active_clock_fraction = 0u;
+    m->active_clock_idle_oversleep_ns = 0u;
+    m->active_clock_idle_credit_ticks = 0u;
+    m->active_clock_idle_repaid_ticks = 0u;
+    m->active_clock_updates = 0u;
+    m->active_clock_added_ticks = 0u;
+    m->active_clock_clamps = 0u;
+    m->active_clock_failures = 0u;
+    m->active_clock_input_guard_host_ns = 0u;
+    m->active_clock_input_guards = 0u;
+    m->active_clock_input_guard_quiesces = 0u;
+    m->active_clock_deadline_shields = 0u;
+    m->active_clock_anchor_valid = false;
+    m->active_clock_input_guard = false;
+    m->active_clock_input_guard_host_valid = false;
+    m->active_clock_deadline_shield = false;
+    if (now) m->active_host_now = now;
+    return true;
+}
+
+bool s5l8900_set_active_clock_work_budget(s5l8900_t *m,
+                                          uint32_t ticks_per_retirement) {
+    if (!m || ticks_per_retirement == 0u ||
+        ticks_per_retirement > S5L8900_ACTIVE_CLOCK_MAX_WORK_TICKS)
+        return false;
+    m->active_clock_max_ticks_per_retirement = ticks_per_retirement;
+    active_clock_reset_anchor(m);
+    return true;
+}
+
+bool s5l8900_resume_active_host_clock(s5l8900_t *m,
+                                      uint64_t paused_at_ns,
+                                      uint64_t resumed_at_ns) {
+    if (!m) return false;
+    if (!m->active_host_now) return true;
+    bool valid = paused_at_ns != 0u && resumed_at_ns >= paused_at_ns &&
+        (!m->active_clock_anchor_valid ||
+         paused_at_ns >= m->active_clock_last_host_ns) &&
+        (!m->active_clock_input_guard_host_valid ||
+         paused_at_ns >= m->active_clock_input_guard_host_ns);
+    if (!valid) {
+        active_clock_counter_add(&m->active_clock_failures, 1u);
+        m->active_clock_input_guard_host_ns = 0u;
+        m->active_clock_input_guard_host_valid = false;
+    } else if (m->active_clock_input_guard_host_valid) {
+        /* Subtract the preserved age from the new instant instead of adding
+         * an unbounded pause duration to an old timestamp. The ordered checks
+         * above prove both subtractions fit, even close to UINT64_MAX. */
+        uint64_t age = paused_at_ns - m->active_clock_input_guard_host_ns;
+        m->active_clock_input_guard_host_ns = resumed_at_ns - age;
+    }
+    active_clock_reset_anchor(m);
+    return valid;
+}
+
+bool s5l8900_set_uart4_host(s5l8900_t *m, s5l_uart4_host_tx_fn tx,
+                            s5l_uart4_host_service_fn service,
+                            s5l_uart4_host_refill_fn refill, void *ctx) {
+    if (!m) return false;
+    if (!tx && !service && !refill) {
+        if (ctx) return false;
+        /* Clear the callable fields first, then their borrowed context. */
+        m->uart4_host_tx = NULL;
+        m->uart4_host_service = NULL;
+        m->uart4_host_refill = NULL;
+        m->uart4_host_ctx = NULL;
+        return true;
+    }
+    if (!tx || !service || !refill) return false;
+
+    /* Publish the context before either callback becomes callable. */
+    m->uart4_host_ctx = ctx;
+    m->uart4_host_tx = tx;
+    m->uart4_host_service = service;
+    m->uart4_host_refill = refill;
+    return true;
+}
+
+bool s5l8900_set_uart0_host(s5l8900_t *m, s5l_uart0_host_tx_fn tx, void *ctx) {
+    if (!m) return false;
+    if (!tx && ctx) return false;
+    m->uart0_host_ctx = ctx;
+    m->uart0_host_tx = tx;
+    return true;
+}
+
+bool s5l8900_set_restart_host(s5l8900_t *m,
+                              s5l_restart_host_service_fn service, void *ctx) {
+    if (!m) return false;
+    if (!service && ctx) return false;
+    m->restart_host_service = service;
+    m->restart_host_ctx = ctx;
+    return true;
+}
+
+static unsigned pre_step_filter_bit(uint32_t pc) {
+    uint32_t word = pc >> 1u;
+    return (unsigned)((word ^ (word >> 10u) ^ (word >> 20u)) & 63u);
+}
+
+static bool pre_step_target_matches(const s5l8900_t *m, uint32_t pc) {
+    if (!m || !m->pre_step_hook || !m->pre_step_target_count) return false;
+    pc &= ~UINT32_C(1);
+    if ((m->pre_step_filter &
+         (UINT64_C(1) << pre_step_filter_bit(pc))) == 0u)
+        return false;
+    for (unsigned i = 0u; i < m->pre_step_target_count; i++) {
+        if (m->pre_step_target[i] == pc) return true;
+    }
+    return false;
+}
+
+bool s5l8900_pre_step_target(const s5l8900_t *m, uint32_t pc) {
+    return pre_step_target_matches(m, pc);
+}
+
+bool s5l8900_set_pre_step_hook(s5l8900_t *m, s5l_pre_step_fn fn, void *ctx,
+                               const uint32_t *targets, unsigned count) {
+    if (!m) return false;
+    if (!fn) {
+        if (targets || count) return false;
+        m->pre_step_hook = NULL;
+        m->pre_step_ctx = NULL;
+        memset(m->pre_step_target, 0, sizeof m->pre_step_target);
+        m->pre_step_target_count = 0u;
+        m->pre_step_filter = 0u;
+        m->pre_step_matches = 0u;
+        m->pre_step_handled = 0u;
+        s5l8900_static_a64_invalidate_derived(m);
+        return true;
+    }
+    if (!targets || !count || count > S5L_PRE_STEP_TARGET_MAX) return false;
+    for (unsigned i = 0u; i < count; i++) {
+        if (targets[i] & 1u) return false;
+        for (unsigned j = 0u; j < i; j++) {
+            if (targets[j] == targets[i]) return false;
+        }
+    }
+
+    /* Validate the whole request before changing any live policy. */
+    memcpy(m->pre_step_target, targets, count * sizeof targets[0]);
+    memset(m->pre_step_target + count, 0,
+           (S5L_PRE_STEP_TARGET_MAX - count) * sizeof targets[0]);
+    m->pre_step_target_count = count;
+    m->pre_step_filter = 0u;
+    for (unsigned i = 0u; i < count; i++)
+        m->pre_step_filter |=
+            UINT64_C(1) << pre_step_filter_bit(targets[i]);
+    m->pre_step_ctx = ctx;
+    m->pre_step_hook = fn;
+    m->pre_step_matches = 0u;
+    m->pre_step_handled = 0u;
+    s5l8900_static_a64_invalidate_derived(m);
+    return true;
+}
+
+uint64_t s5l8900_pre_step_matches(const s5l8900_t *m) {
+    return m ? m->pre_step_matches : 0u;
+}
+
+uint64_t s5l8900_pre_step_handled(const s5l8900_t *m) {
+    return m ? m->pre_step_handled : 0u;
+}
+
+void s5l8900_set_user_observers(s5l8900_t *m,
+                                void (*svc)(void *ctx, struct arm_cpu *cpu, uint32_t pc, uint32_t swi_num),
+                                void (*fault)(void *ctx, struct arm_cpu *cpu, uint32_t vector, uint32_t far, uint32_t fsr),
+                                void *ctx) {
+    if (!m) return;
+    m->bus.user_svc_observer = svc;
+    m->bus.user_svc_ctx = ctx;
+    m->bus.user_fault_observer = fault;
+    m->bus.user_fault_ctx = ctx;
+}
+
+/* -------------------------------------------------------- wake sources ---
+ *
+ * Which modelled devices can end a WFI, and how far away each one's next
+ * interrupt edge is.  See the wake-source block in soc.h for the contract;
+ * what follows is why this is a table at all.
+ *
+ * It used to be an if-chain inside machine_wait_for_interrupt() naming the
+ * timer, the CLCD and TV-out.  That made the fast-forward the real definition
+ * of "things that can interrupt this machine", and it was a definition nobody
+ * would think to come and update: a device could be modelled correctly, assert
+ * its line correctly, and still never be observed, because the idle skip
+ * stepped over the tick it fired on.  Declaring a source here is now the whole
+ * of wiring one into WFI, exactly as DEVICE_WINDOWS is the whole of putting a
+ * window on the bus.
+ *
+ * These three functions are the old if-chain's conditions, unchanged.  Each
+ * runs only when its VIC line is enabled, which is the test the chain applied
+ * to all three by hand.
+ */
+
+/*
+ * Can `line` reach the CPU at all?  The flat 0-63 numbering is the device
+ * tree's own and both VICs drive the core (see s5l8900_tick), so the gate is
+ * simply "enabled in the VIC that carries it".  A line outside the pair is not
+ * one this machine can route: s5l_vic_set_line() drops it, so nothing could
+ * ever assert it and there is nothing to wait for.
+ *
+ * CPSR is deliberately not consulted — an ARM1176 completes WFI on the raw
+ * line whether or not the exception is masked — and neither is INTSELECT,
+ * because IRQ and FIQ both wake the core.
+ */
+static bool wake_line_enabled(const s5l8900_t *m, unsigned line) {
+    if (line >= 32u * S5L8900_VIC_COUNT) return false;
+    return (m->vic[line / 32u].enable & (1u << (line % 32u))) != 0u;
+}
+
+/* Ask the timer itself: the PWM first compare does not reset the counter,
+ * and its masked second compare must not be mistaken for a wake source. */
+static s5l_wake_kind_t wake_edge_timer(const s5l8900_t *m, uint32_t *ticks) {
+    uint32_t until = s5l_timer_ticks_to_irq(&m->timer);
+    if (until == 0u) return S5L_WAKE_NEVER;
+    *ticks = until;
+    return S5L_WAKE_AT;
+}
+
+/* The CLCD's frame (VBL) latch, which only exists while scanout is live and
+ * the controller's own mask lets it through. */
+static s5l_wake_kind_t wake_edge_clcd(const s5l8900_t *m, uint32_t *ticks) {
+    if ((m->clcd.intmask & CLCD_INT_FRAME) == 0u ||
+        !s5l_clcd_running(&m->clcd) || m->clcd.frame_ticks == 0u)
+        return S5L_WAKE_NEVER;
+    /* frame_accum is normally strictly below frame_ticks.  If a malformed
+     * in-memory caller violates that invariant, one tick is the only safe
+     * boundary: the CLCD normalizes it and asserts the frame latch there. */
+    *ticks = m->clcd.frame_accum < m->clcd.frame_ticks
+           ? m->clcd.frame_ticks - m->clcd.frame_accum
+           : 1u;
+    return S5L_WAKE_AT;
+}
+
+/* TV-out SDO VSYNC.  The device answers "no deliverable VSYNC" with zero,
+ * which is a statement about its state (stopped, masked, already pending) and
+ * therefore S5L_WAKE_NEVER rather than an unknown. */
+static s5l_wake_kind_t wake_edge_tvout(const s5l8900_t *m, uint32_t *ticks) {
+    uint32_t until = s5l_tvout_ticks_to_vsync(&m->tvout);
+    if (until == 0u) return S5L_WAKE_NEVER;
+    *ticks = until;
+    return S5L_WAKE_AT;
+}
+
+/*
+ * The two SPI controllers.
+ *
+ * Both answer S5L_WAKE_NEVER unconditionally, and that is a statement about the
+ * model rather than a placeholder. An SPI word completes as a direct
+ * consequence of a guest store into the transmit FIFO, and a core in WFI issues
+ * no stores; a line that was already high before the WFI is caught by
+ * machine_wait_for_interrupt()'s own pre-check, before any source is consulted.
+ * So there is no future edge to name, and NEVER — the only answer that lets
+ * guest time be skipped — is the correct one. Answering S5L_WAKE_UNKNOWN
+ * instead would be safe but would stop the machine fast-forwarding ANY idle
+ * period for the whole boot.
+ *
+ * They are declared anyway, because the table is this machine's definition of
+ * what can interrupt it (see the wake-source block in soc.h). A touch device
+ * that raises a report on its own schedule rather than in reply to a store is
+ * exactly the case the table exists for, and this is the entry it edits.
+ */
+static s5l_wake_kind_t wake_edge_spi0(const s5l8900_t *m, uint32_t *ticks) {
+    (void)m; (void)ticks;
+    return S5L_WAKE_NEVER;
+}
+static s5l_wake_kind_t wake_edge_spi1(const s5l8900_t *m, uint32_t *ticks) {
+    (void)m; (void)ticks;
+    return S5L_WAKE_NEVER;
+}
+
+/*
+ * The seven GPIO interrupt groups.
+ *
+ * All seven are declared, not just group 4. Nothing else in the shipped tree
+ * claims VIC lines 0, 1, 2, 3, 31, 32 or 33, so declaring the whole cascade
+ * costs nothing and removes the question of whether /arm-io/gpio's descending
+ * `interrupts` array is indexed by group or reversed — get that wrong for one
+ * entry and the touch line is routed to a VIC line nobody enabled, silently.
+ * Lines 32 and 33 are on VIC1, which is why s5l8900_tick() has to route by
+ * line/32 rather than hardcoding vic[0] the way every older device does.
+ *
+ * Every one answers S5L_WAKE_NEVER, and that survives the touch controller
+ * gaining a report to deliver. The reasoning is the same as the SPI
+ * controllers': a future edge is only worth naming if this machine can produce
+ * one while the core sleeps, and the multitouch attention line moves at exactly
+ * two moments — a host call to s5l_mtz2_set_contacts(), which happens BETWEEN
+ * guest instructions and therefore never inside a skipped interval, and the
+ * last byte of a data read, which is a consequence of a guest store the sleeping
+ * core is not making. A line that is ALREADY asserted is caught by
+ * machine_wait_for_interrupt()'s own pre-check — it refreshes at zero elapsed
+ * time, which routes s5l_mtz2_irq() through the cascade before any source is
+ * consulted — so NEVER cannot lose an interrupt that has already happened, and
+ * an injection made during a WFI is observed on the very next refresh.
+ *
+ * The entry that matters is `gpio-group4`, and the number on it is 2 — the
+ * CASCADE VIC line, not 155. wake_line_enabled() rejects anything at or above
+ * 32 * S5L8900_VIC_COUNT, so a source written as `{ "multitouch", 155, ... }`
+ * would return false silently and could never wake the core.
+ */
+static s5l_wake_kind_t wake_edge_gpio(const s5l8900_t *m, uint32_t *ticks) {
+    (void)m; (void)ticks;
+    return S5L_WAKE_NEVER;
+}
+
+/* N82 i2s0 interrupts {0x86,0}: GPIO group 4, bit 6, cascade VIC 2.
+ * Unlike host-driven touch, its clock has a predictable next edge. */
+static s5l_wake_kind_t wake_edge_gpio4(const s5l8900_t *m, uint32_t *ticks) {
+    if (m->gpioic.en[4] & (1u << 6)) {
+        uint32_t next = s5l_i2s_clock_next(&m->i2s[0], m->tb_hz);
+        if (next) { *ticks = next; return S5L_WAKE_AT; }
+    }
+    return S5L_WAKE_NEVER;
+}
+
+/*
+ * uart4's receive line, and the answer docs/derivations.md §23.5.1 asked for:
+ * "S5L_WAKE_NEVER when the RX FIFO is empty and an immediate edge when it is
+ * not". Both halves of that sentence are NEVER here, and the difference is only
+ * in who catches the second half.
+ *
+ * A host-delivered byte has no schedule — the host pushes it between run
+ * slices, which is a moment a sleeping core is not inside — so there is no
+ * future distance to name and this source can never produce one. A FIFO with an
+ * UNACKNOWLEDGED arrival in it has already asserted the line, and
+ * machine_wait_for_interrupt() refreshes every level at zero elapsed time
+ * before consulting any source, so it ends the wait there. (A FIFO the driver
+ * has acknowledged but not drained asserts nothing — the latch is edge
+ * triggered, see the UART block in soc.h — and there is still nothing to wait
+ * for either: only an arrival can latch it, and only the host can produce one.)
+ * Answering S5L_WAKE_AT with 0 would be rejected as "not a future distance"
+ * anyway (s5l8900_next_wake), and answering UNKNOWN would stop the machine
+ * fast-forwarding any idle period for the whole boot — on a source that is
+ * inert on every run without a peer.
+ *
+ * It is declared rather than omitted for the reason the SPI block gives: this
+ * table is the machine's definition of what can interrupt it, and a device
+ * missing from it is a device the next reader has to rediscover.
+ */
+static s5l_wake_kind_t wake_edge_uart4(const s5l8900_t *m, uint32_t *ticks) {
+    (void)m; (void)ticks;
+    return S5L_WAKE_NEVER;
+}
+
+/* I2S changes DMA requests at each serial sample edge. WFI may sleep up to
+ * that edge, not over an entire buffer's eventual terminal-count interrupt.
+ * Other current DMA request sources are synchronous or host-fed. */
+static s5l_wake_kind_t wake_edge_dmac(const s5l8900_t *m, uint32_t *ticks) {
+    uint32_t next = s5l_i2s_audio_next(&m->i2s[0], m->tb_hz);
+    if (next) { *ticks = next; return S5L_WAKE_AT; }
+    return S5L_WAKE_NEVER;
+}
+
+/* Host packets arrive only between batches, never inside a WFI fast-forward. */
+static s5l_wake_kind_t wake_edge_usb(const s5l8900_t *m, uint32_t *ticks) {
+    (void)m; (void)ticks;
+    return S5L_WAKE_NEVER;
+}
+
+static const s5l_wake_source_t WAKE_SOURCES[] = {
+    { "timer", S5L8900_IRQ_TIMER, wake_edge_timer },
+    { "clcd",  S5L8900_IRQ_CLCD,  wake_edge_clcd  },
+    { "tvout", S5L8900_IRQ_TVOUT, wake_edge_tvout },
+    { "spi0",  S5L8900_IRQ_SPI0,  wake_edge_spi0  },
+    { "spi1",  S5L8900_IRQ_SPI1,  wake_edge_spi1  },
+    /* Group order, so entry k is group k. The lines are /arm-io/gpio's own
+     * `interrupts` = {33,32,31,3,2,1,0}; group 4 -> VIC line 2 carries touch. */
+    { "gpio-group0", 33u, wake_edge_gpio },
+    { "gpio-group1", 32u, wake_edge_gpio },
+    { "gpio-group2", 31u, wake_edge_gpio },
+    { "gpio-group3",  3u, wake_edge_gpio },
+    { "gpio-group4",  2u, wake_edge_gpio4 },
+    { "gpio-group5",  1u, wake_edge_gpio },
+    { "gpio-group6",  0u, wake_edge_gpio },
+    { "uart4-rx", S5L8900_IRQ_UART4, wake_edge_uart4 },
+    { "dmac0", S5L8900_IRQ_DMAC0, wake_edge_dmac },
+    { "dmac1", S5L8900_IRQ_DMAC1, wake_edge_dmac },
+    { "usb-otg", S5L8900_IRQ_USB_OTG, wake_edge_usb },
+};
+#define NWAKE_SOURCES (sizeof WAKE_SOURCES / sizeof WAKE_SOURCES[0])
+
+unsigned s5l8900_wake_sources(const s5l_wake_source_t **out) {
+    if (out) *out = WAKE_SOURCES;
+    return (unsigned)NWAKE_SOURCES;
+}
+
+s5l_wake_kind_t s5l8900_next_wake(const s5l8900_t *m,
+                                  const s5l_wake_source_t *src, unsigned n,
+                                  uint32_t *ticks) {
+    /* Nothing to reason about is not the same as nothing to wait for, so both
+     * of these decline to skip time rather than reporting a clear horizon. */
+    if (!m) return S5L_WAKE_UNKNOWN;
+    if (n != 0u && !src) return S5L_WAKE_UNKNOWN;
+
+    bool have = false;
+    uint32_t best = 0;
+    for (unsigned i = 0; i < n; i++) {
+        /* A masked line cannot reach the CPU, so its device cannot end this
+         * wait however close its next edge is.  Skipping it here is what makes
+         * the old chain's per-source VIC test unnecessary. */
+        if (!wake_line_enabled(m, src[i].line)) continue;
+        if (!src[i].next_edge) return S5L_WAKE_UNKNOWN;   /* declared, silent */
+
+        uint32_t at = 0;
+        s5l_wake_kind_t kind = src[i].next_edge(m, &at);
+        if (kind == S5L_WAKE_NEVER) continue;
+        /* Anything that is not a future distance stops the fast-forward: an
+         * unknown, or an "at" of zero, which cannot be a moment still to come
+         * (the caller has already refreshed every line at zero elapsed time). */
+        if (kind != S5L_WAKE_AT || at == 0u) return S5L_WAKE_UNKNOWN;
+        if (!have || at < best) { best = at; have = true; }
+    }
+
+    if (!have) return S5L_WAKE_NEVER;
+    if (ticks) *ticks = best;
+    return S5L_WAKE_AT;
+}
+
+/*
+ * Complete one ARM1176 Wait For Interrupt operation without manufacturing CPU
+ * work.  The earliest edge any declared wake source can route through the VIC
+ * is the earliest point at which this model can wake the core.  Advancing
+ * farther would coalesce guest-visible work across an interrupt; advancing
+ * less would merely replace the kernel's idle loop with a host idle loop.
+ */
+static void active_clock_quiesce_input_guard(s5l8900_t *m);
+
+static bool machine_wait_for_interrupt(void *ctx) {
+    s5l8900_t *m = ctx;
+    if (!m) return false;
+
+    /* A line that is already high completes WFI even when CPSR masks it.  This
+     * check precedes the controller refresh so an externally injected CPU line
+     * is not lost. */
+    if (m->cpu.irq_line || m->cpu.fiq_line) return true;
+
+    /* Guest writes can change a VIC enable/mask or acknowledge a source after
+     * the preceding instruction's tick.  Refresh level outputs at zero elapsed
+     * time before deciding whether a future edge is necessary. */
+    s5l8900_tick(m, 0);
+    if (m->cpu.irq_line || m->cpu.fiq_line) return true;
+
+    /*
+     * With no enabled source able to name a future edge — because none has one
+     * (NEVER), or because one of them cannot say (UNKNOWN) — there is nothing
+     * safe to fast-forward to.  Return to the interpreter's documented no-op
+     * fallback rather than hanging the host forever, inventing an interrupt, or
+     * skipping guest time past a source that might have fired inside it.  The
+     * guest still makes progress: the WFI retires, and the run loop's own tick
+     * moves time on by one.
+     */
+    uint32_t edge_tb = 0;
+    const s5l_wake_source_t *sources = NULL;
+    unsigned nsources = s5l8900_wake_sources(&sources);
+    if (s5l8900_next_wake(m, sources, nsources, &edge_tb) != S5L_WAKE_AT)
+        return false;
+
+    uint64_t cpu_ticks;
+    if (m->cpu_hz && m->tb_hz) {
+        /* s5l8900_tick's integer converter can cross at most one timebase edge
+         * per CPU tick only in this direction.  Refuse unusual inverted or
+         * corrupt ratios instead of jumping past the earliest edge. */
+        if (m->tb_hz > m->cpu_hz || m->tb_accum >= m->cpu_hz) return false;
+        uint64_t need = (uint64_t)edge_tb * m->cpu_hz - m->tb_accum;
+        cpu_ticks = need / m->tb_hz + (need % m->tb_hz != 0u);
+    } else {
+        /* Existing zero-clock fallback: s5l8900_tick treats its input as raw
+         * timebase ticks when either advertised rate is zero. */
+        cpu_ticks = edge_tb;
+    }
+
+    /*
+     * Deterministic harnesses deliberately have no callback and still jump to
+     * the edge immediately.  An interactive frontend may instead make each
+     * autonomous interval consume the same order of host time as guest time.
+     *
+     * Never wait more than one short host slice. A stopped CLCD can leave the
+     * next timer edge seconds away, while the frontend can inject touch or a
+     * stop request only between s5l8900_run() calls. Advancing a shorter,
+     * already-waited interval is safe because next_wake proved that no modeled
+     * source can fire before the selected edge. The WFI may complete spuriously
+     * at that intermediate point; ARM permits that, and the historical UNKNOWN
+     * fallback already relies on the same harmless behavior.
+     */
+    if (m->wfi_host_sleep) {
+        if (!m->cpu_hz || !m->tb_hz || m->tb_hz > m->cpu_hz) {
+            m->wfi_pace_yield = true;
+            m->wfi_paced_failures++;
+            return false;
+        }
+
+        /* Before the deadline, do not mistake a display or animation timer for
+         * completed foreground work: a next wake at least one modeled second
+         * away is the strong idle witness.  Once the deadline shield has
+         * engaged, however, this WFI is itself the missing witness.  The guest
+         * has stopped the CPU-bound work the shield existed to protect and is
+         * willingly waiting for a device edge.  Keeping instruction time after
+         * that yield made the shield permanent on real iPhone OS 3 workloads,
+         * whose ordinary housekeeping timers never leave a one-second gap. */
+        uint64_t quiescent_ticks =
+            (uint64_t)m->cpu_hz *
+            S5L8900_ACTIVE_CLOCK_QUIESCENT_WFI_SECONDS;
+        if (m->active_clock_input_guard &&
+            (m->active_clock_deadline_shield ||
+             cpu_ticks >= quiescent_ticks))
+            active_clock_quiesce_input_guard(m);
+
+        uint64_t slice_ticks =
+            (S5L8900_WFI_PACE_SLICE_NS * m->cpu_hz) / UINT64_C(1000000000);
+        bool partial = cpu_ticks > slice_ticks;
+        uint64_t paced_ticks = partial ? slice_ticks : cpu_ticks;
+        uint64_t idle_start_ns = 0u;
+        bool idle_measured = m->active_host_now &&
+            m->active_clock_anchor_valid && !m->active_clock_deadline_shield &&
+            m->active_host_now(m->active_host_now_ctx, &idle_start_ns) &&
+            idle_start_ns >= m->active_clock_last_host_ns;
+        if (!idle_measured) m->active_clock_idle_credit_ticks = 0u;
+        /* The CPU has voluntarily yielded. Reuse bounded time withheld while
+         * it was busy instead of making it wait for that time a second time.
+         * This never advances past next_wake's edge or lengthens an 8 ms slice;
+         * even a wholly prepaid slice yields to the frontend for fresh input. */
+        uint64_t idle_credit = m->active_clock_idle_credit_ticks < paced_ticks
+            ? m->active_clock_idle_credit_ticks : paced_ticks;
+        uint64_t wait_ticks = paced_ticks - idle_credit;
+        uint64_t wait_ns;
+
+        if (!paced_ticks) {
+            /* At a synthetic clock below 125 Hz, even one CPU tick is longer
+             * than the responsiveness ceiling. Wait one slice, advance no
+             * guest time, and yield. Real S5L8900 clocks never take this path. */
+            wait_ns = S5L8900_WFI_PACE_SLICE_NS;
+        } else {
+            /* paced_ticks is bounded by the 8 ms slice, so this product cannot
+             * overflow for any uint32_t CPU rate. Round up: waiting a fraction
+             * too long is harmless; advancing before the requested interval
+             * completed would recreate the bug this policy exists to stop. */
+            uint64_t scaled = wait_ticks * UINT64_C(1000000000);
+            wait_ns = scaled / m->cpu_hz + (scaled % m->cpu_hz != 0u);
+        }
+
+        m->wfi_pace_yield = true;
+        if (wait_ns) m->wfi_paced_waits++;
+        if (UINT64_MAX - m->wfi_paced_wait_ns < wait_ns)
+            m->wfi_paced_wait_ns = UINT64_MAX;
+        else
+            m->wfi_paced_wait_ns += wait_ns;
+
+        /* Attribute scheduler oversleep to the successful idle wait itself,
+         * not to any CPU work before it. At the real 412 MHz clock a lone WFI
+         * has only tens of nanoseconds of retirement credit; charging ordinary
+         * millisecond oversleep to that credit stretched idle guest time. The
+         * paired samples do not move devices or cross the selected wake edge.
+         * The usual post-retirement synchronization consumes this allowance. */
+        if (wait_ns && !m->wfi_host_sleep(m->wfi_host_sleep_ctx, wait_ns)) {
+            m->wfi_paced_failures++;
+            m->active_clock_idle_credit_ticks = 0u;
+            s5l8900_tick(m, 0u);
+            return m->cpu.irq_line || m->cpu.fiq_line;
+        }
+        uint64_t idle_end_ns = 0u;
+        if (wait_ns && idle_measured &&
+            m->active_host_now(m->active_host_now_ctx, &idle_end_ns) &&
+            idle_end_ns >= idle_start_ns &&
+            idle_end_ns - idle_start_ns > wait_ns) {
+            uint64_t oversleep = idle_end_ns - idle_start_ns - wait_ns;
+            uint64_t room = S5L8900_ACTIVE_CLOCK_MAX_STEP_NS -
+                m->active_clock_idle_oversleep_ns;
+            m->active_clock_idle_oversleep_ns +=
+                oversleep < room ? oversleep : room;
+        }
+        m->active_clock_idle_credit_ticks -= idle_credit;
+        m->active_clock_idle_repaid_ticks += idle_credit;
+
+        if (partial) {
+            m->wfi_paced_partial_advances++;
+            if (paced_ticks) s5l8900_tick(m, (uint32_t)paced_ticks);
+            else s5l8900_tick(m, 0u);
+            return m->cpu.irq_line || m->cpu.fiq_line;
+        }
+    }
+
+    /* The public tick API is 32-bit.  Split a very long wait without changing
+     * the exact fractional accumulator; no selected wake edge occurs before
+     * the total derived above. */
+    while (cpu_ticks > UINT32_MAX) {
+        s5l8900_tick(m, UINT32_MAX);
+        cpu_ticks -= UINT32_MAX;
+        if (m->cpu.irq_line || m->cpu.fiq_line) return true;
+    }
+    if (cpu_ticks) s5l8900_tick(m, (uint32_t)cpu_ticks);
+    return m->cpu.irq_line || m->cpu.fiq_line;
+}
+
+/* ----------------------------------------------------------- lifecycle --- */
+
+/*
+ * S5LBOX_TICK_EAGER=1 restores the per-instruction refresh s5l8900_tick() used
+ * to do unconditionally. It exists so the two paths can be run against each
+ * other on the same binary and the same boot — which is the only way to claim
+ * the skip changes nothing the guest can see — and it is read once per machine
+ * rather than per tick. A machine-independent static because it describes the
+ * BUILD under test, not a property of a machine, and therefore must not enter
+ * a snapshot.
+ */
+static bool g_tick_eager;
+static bool g_tick_eager_read;
+
+bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
+    if (!m) return false;
+    memset(m, 0, sizeof *m);
+
+    /*
+     * Refuse an aliasing configuration before allocating anything.
+     *
+     * This is the whole routing contract in three lines (soc.h explains why it
+     * lives here rather than in bus_read). A machine whose DRAM window covers a
+     * device window can only ever be one of two wrong things: a device that
+     * cannot be reached, or a hole in the DRAM bank the guest was promised.
+     * Neither is worth having, and both are invisible at run time, so the
+     * machine simply does not exist.
+     */
+    if (!ram_size || (uint64_t)ram_base + ram_size > 0x100000000ull ||
+        s5l8900_ram_conflict(ram_base, ram_size)) return false;
+
+    m->ram = calloc(ram_size, 1);
+    /* The MBX aperture's edram, owned here like RAM. See S5L_MBX_APERTURE.
+     * A failure is handled below with the RAM failure, not ignored. */
+    m->mbx.edram = calloc(S5L_MBX_EDRAM_SIZE, 1);
+    if (!m->ram || !m->mbx.edram) {
+        free(m->ram);
+        m->ram = NULL;
+        free(m->mbx.edram);
+        m->mbx.edram = NULL;
+        return false;
+    }
+    m->ram_base = ram_base;
+    m->ram_size = ram_size;
+    m->cpu_hz   = S5L8900_CPU_HZ;
+    m->tb_hz    = S5L8900_TB_HZ;
+    m->active_clock_max_ticks_per_retirement =
+        S5L8900_ACTIVE_CLOCK_DEFAULT_WORK_TICKS;
+
+    s5l_uart_reset(&m->uart0);
+    s5l_uart_reset(&m->uart4);
+    for (unsigned i = 0; i < S5L8900_VIC_COUNT; i++) s5l_vic_reset(&m->vic[i]);
+    s5l_timer_reset(&m->timer);
+    s5l_power_reset(&m->power);
+    s5l_mbx_reset(&m->mbx);
+    s5l_clcd_reset(&m->clcd);
+    s5l_tvout_reset(&m->tvout, m->tb_hz);
+    for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
+        s5l_i2c_reset(&m->i2c[i]);
+    s5l_pcf50635_reset(&m->pmu, m->tb_hz);
+    s5l_wm8991_reset(&m->codec);
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) s5l_i2s_reset(&m->i2s[i]);
+    for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) s5l_spi_reset(&m->spi[i]);
+    s5l_gpioic_reset(&m->gpioic);
+    s5l_gpio_reset(&m->gpio);
+    /*
+     * The board's five switches, and the ORDER MATTERS: both blocks above
+     * power up all-zero, and two of the five buttons are active low, so their
+     * released level is HIGH. Applying the rest state here — after the resets
+     * that would wipe it, before the guest has configured anything — is what
+     * stops the volume keys from reading as held down for the whole boot. See
+     * s5l_buttons_reset() for why zeroing the struct is not enough.
+     */
+    s5l_buttons_reset(&m->buttons);
+    s5l_buttons_apply(&m->buttons, &m->gpio, &m->gpioic);
+    s5l_usbotg_reset(&m->usbotg);
+    for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++)
+        s5l_pl080_reset(&m->dmac[i]);
+    {
+        s5l_i2c_slave_t pmu;
+        s5l_pcf50635_bind(&m->pmu, &pmu);
+        if (!s5l_i2c_attach(&m->i2c[0], &pmu)) {
+            free(m->ram);
+            m->ram = NULL;
+            free(m->mbx.edram);
+            m->mbx.edram = NULL;
+            return false;
+        }
+        /*
+         * The WM8991 codec, /arm-io/i2c0/audio0 at seven-bit 0x1B. Attached
+         * next to the PMU on the same controller because the device tree puts
+         * it there; S5L_I2C_SLAVES has room for four, so this needs no header
+         * change. The other two nodes on i2c0 — the lis331dl accelerometer at
+         * 0x1d and the isl29003 ambient-light sensor at 0x44 — stay
+         * deliberately absent: nothing has established what they must answer,
+         * and an address that NAKs is a driver that fails cleanly, which is
+         * what both do today.
+         */
+        s5l_i2c_slave_t codec;
+        s5l_wm8991_bind(&m->codec, &codec);
+        if (!s5l_i2c_attach(&m->i2c[0], &codec)) {
+            free(m->ram);
+            m->ram = NULL;
+            free(m->mbx.edram);
+            m->mbx.edram = NULL;
+            return false;
+        }
+    }
+    /*
+     * /arm-io/spi0/lcd0 is the Merlot panel at reg[0] == 1. The first late
+     * transaction measured from AppleMerlotLCD::_lcdEnable is the transmit-only
+     * pair 55 02. Even a transmit-only SPI word clocks a receive word into this
+     * controller, and its stock interrupt filter must drain that word before it
+     * calls finishTransfer and wakes the synchronous requester.
+     *
+     * The endpoint also exposes the only panel status contract measured in the
+     * driver: the enable path reads register 0x15 until bit 0 says ready. It
+     * does not otherwise interpret commands or alter CLCD scanout. The NOR at
+     * select 0 remains the separate memory window. Until the GPIO
+     * platform-function selects are routed into s5l_spi_t, all modelled SPI0
+     * controller traffic therefore uses lcd0's device-tree select explicitly.
+     */
+    {
+        s5l_spi_slave_t lcd;
+        s5l_spi_lcd_bind(&lcd, &m->spi[0]);
+        if (!s5l_spi_attach(&m->spi[0], S5L_SPI0_LCD_CS, &lcd)) {
+            free(m->ram);
+            m->ram = NULL;
+            free(m->mbx.edram);
+            m->mbx.edram = NULL;
+            return false;
+        }
+        m->spi[0].cs = S5L_SPI0_LCD_CS;
+    }
+
+    /*
+     * The touch controller on spi1 chip select 0 — where
+     * /arm-io/spi1/multi-touch is; the select is reg[0] of that node, since
+     * there is no `chip-select` property anywhere in the shipped tree. It
+     * replaces the null device that proved the controller: that one answered
+     * every word with 0x00, which made AppleMultitouchZ2SPI's HBPP probe
+     * complete and fail cleanly instead of sleeping with no deadline, but a
+     * clean failure still detaches the driver.
+     */
+    s5l_mtz2_reset(&m->mtz2);
+    {
+        s5l_spi_slave_t touch;
+        s5l_mtz2_bind(&m->mtz2, &touch);
+        if (!s5l_spi_attach(&m->spi[1], 0u, &touch)) {
+            free(m->ram);
+            m->ram = NULL;
+            free(m->mbx.edram);
+            m->mbx.edram = NULL;
+            return false;
+        }
+    }
+    /*
+     * The three GPIO pins the touch controller can observe.
+     *
+     * `function-reset` (GPIO 0x0606 = group 6 bit 6) and `function-power_ldo`
+     * (0x0701 = group 7 bit 1) are /arm-io/spi1/multi-touch's own;
+     * `function-spi_cs0` (0x1800 = group 24 bit 0) is /arm-io/spi1's. Only the
+     * reset line distinguishes resetDevice's dummy transfer from the probe
+     * that follows it. The select resynchronises command framing, and a power
+     * edge discards the flashless Z2's downloaded image so its next probe sees
+     * HBPP again (see s5l_mtz2_power_pin). A failure to subscribe is folded
+     * into the same counter a refused stub declaration is, rather than
+     * refusing to build a machine over a diagnostic.
+     */
+    if (!s5l_gpio_watch(&m->gpio, MTZ2_PIN_RESET, &m->mtz2, s5l_mtz2_reset_pin))
+        m->stub_declare_failures++;
+    if (!s5l_gpio_watch(&m->gpio, MTZ2_PIN_SELECT, &m->mtz2, s5l_mtz2_select_pin))
+        m->stub_declare_failures++;
+    if (!s5l_gpio_watch(&m->gpio, MTZ2_PIN_POWER, &m->mtz2, s5l_mtz2_power_pin))
+        m->stub_declare_failures++;
+    /* Refresh in the guest's own time: the CLCD is ticked with timebase ticks,
+     * so the period is expressed in them. */
+    m->clcd.frame_ticks = m->tb_hz / S5L_CLCD_REFRESH_HZ;
+    if (!s5l_nor_init(&m->nor, S5L8900_NOR_SIZE)) {
+        free(m->ram);
+        m->ram = NULL;
+        free(m->mbx.edram);
+        m->mbx.edram = NULL;
+        return false;
+    }
+
+    /*
+     * Peripheral windows we have identified but not modelled. Each base was
+     * resolved twice — from the VA the guest's own driver printed, walked
+     * through its live page tables, and from the shipped device tree's arm-io
+     * ranges (child + 0x38000000) — and the two agree. They are declared so
+     * their traffic is named and stored instead of reading back as the zero an
+     * unmapped access returns. See s5l_stub_t for why a stub is honest here and
+     * where the line is that turns one into a real device model.
+     *
+     * "Declared" is deliberately weaker than "harmless". The SPI trio below is
+     * on the current boot frontier: run23 proved that SpringBoard's first
+     * CoreTelephony request lands on a launchd-held service queue that
+     * CommCenter has never taken, and CommCenter's only IOKit subscription is
+     * to AppleBaseband, whose reset IOInterruptEventSource sits on GPIO
+     * interrupt 75 and has never fired. Storing spi2's registers does not fix
+     * that and is not claimed to; it stops one identified peripheral from
+     * answering the shipped driver with a fabricated zero.
+     *
+     * A failure to declare one is not fatal but must not be silent, so the
+     * result is folded into a counter the caller can see.
+     */
+    {
+        static const struct { uint32_t base, size; const char *name; } STUBS[] = {
+            /* AppleS5L8900XClockController _ccBaseAddress. */
+            { S5L8900_CLOCK_BASE,  S5L8900_DEV_SIZE,   "clkrstgen" },
+            /* _miuBaseAddress, the clock controller's second reg range.
+             * Offsets 0x008 and 0x404 are the ones actually touched. */
+            { S5L8900_MIU_BASE,    S5L8900_DEV_SIZE,   "miu"       },
+            { S5L8900_EDGEIC_BASE, S5L8900_DEV_SIZE,   "edgeic"    },
+            /* gpio and gpioic used to be here. Both are device models now
+             * (DEVICE_WINDOWS above) — a duplicate declaration would be
+             * refused as an overlap and counted as a failure rather than
+             * shadowing them. */
+            /* spi2, the baseband transport com.apple.driver.BasebandSPI
+             * configures and then reads back. spi0 and spi1 used to be here
+             * too; they are device models now (DEVICE_WINDOWS above), and a
+             * duplicate declaration here would be refused as an overlap and
+             * silently counted as a failure rather than shadowing them. */
+            { S5L8900_SPI2_BASE,   S5L8900_DEV_SIZE,   "spi2"      },
+        };
+        for (unsigned i = 0; i < sizeof STUBS / sizeof STUBS[0]; i++)
+            if (!s5l8900_add_stub(m, STUBS[i].base, STUBS[i].size, STUBS[i].name))
+                m->stub_declare_failures++;
+    }
+
+    /* Nothing has refreshed the levels yet: the resets and s5l_buttons_apply()
+     * above drove pins, and the VIC outputs still hold the memset's zero. The
+     * first tick must be a full one however small it is. */
+    m->level_dirty = true;
+
+    if (!g_tick_eager_read) {
+        const char *eager = getenv("S5LBOX_TICK_EAGER");
+        g_tick_eager = eager && *eager && *eager != '0';
+        g_tick_eager_read = true;
+    }
+
+    m->bus.ctx = m;
+    m->bus.read32 = r32; m->bus.read16 = r16; m->bus.read8 = r8;
+    m->bus.write32 = w32; m->bus.write16 = w16; m->bus.write8 = w8;
+    m->bus.wait_for_interrupt = machine_wait_for_interrupt;
+    m->bus.host_ram = machine_host_ram;
+
+    arm_reset(&m->cpu, &m->bus);
+#if defined(S5LBOX_STATIC_A64_DEFAULT_DIRECT_WRITES)
+    /* This opt-in belongs to the iOS target, whose machine bus is not wrapped
+     * by a RAM-write observer. Generic and diagnostic frontends remain NULL. */
+    if (!s5l8900_set_direct_ram_writes(m, true)) {
+        s5l8900_free(m);
+        return false;
+    }
+#endif
+#if defined(S5LBOX_STATIC_A64_DEFAULT_GRAPH)
+    /* The iOS target explicitly promises the measured, build-time-signed
+     * graph path and its exact timebase-bounded extended invocation. Refuse a
+     * misconfigured binary rather than silently shipping the interpreter or
+     * the older sixteen-instruction boundary while the UI and documentation
+     * imply acceleration. */
+    if (!s5l8900_static_a64_set_enabled(m, true) ||
+        !s5l8900_static_a64_set_graph(m, true) ||
+        !s5l8900_static_a64_set_chain_limit(
+            m, S5LBOX_STATIC_A64_PRODUCT_CHAIN_INSNS)) {
+        s5l8900_free(m);
+        return false;
+    }
+#endif
+#if defined(S5LBOX_STATIC_A64_DEFAULT_COMPACT_RAW)
+    /* Live-byte regions stop at the next device event and commit elapsed
+     * instruction time before any architectural fallback. No decoded graph
+     * array or instruction-clock rate changes with the larger bound. */
+    if (!s5l8900_static_a64_set_enabled(m, true) ||
+        !s5l8900_static_a64_set_compact_raw(m, true) ||
+        !s5l8900_static_a64_set_chain_limit(
+            m, S5LBOX_STATIC_A64_COMPACT_REGION_INSNS)) {
+        s5l8900_free(m);
+        return false;
+    }
+#endif
+    return true;
+}
+
+void s5l8900_free(s5l8900_t *m) {
+    if (!m) return;
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+    s5l8900_static_a64_dispose(m);
+#endif
+    for (unsigned i = 0; i < m->stub_count; i++) {
+        free(m->stubs[i].regs);
+        m->stubs[i].regs = NULL;
+    }
+    m->stub_count = 0;
+    arm_ram_watch_destroy(m->ram_watch);
+    m->ram_watch = NULL;
+    free(m->ram);
+    m->ram = NULL;
+    free(m->mbx.edram);
+    m->mbx.edram = NULL;
+    s5l_nor_free(&m->nor);
+}
+
+void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
+    if (!m || !data || !len) return;
+    /* Check before narrowing: a >4 GiB length must not truncate into range. */
+    if (len > 0xffffffffu) return;
+    if (!in_ram(m, addr, (uint32_t)len)) return;
+    s5l8900_ram_changed(m, addr, (uint32_t)len);
+    memcpy(&m->ram[addr - m->ram_base], data, len);
+}
+
+/*
+ * The inputs a host can move behind the bus, in one word. See `ext_seen` in
+ * soc.h for why the machine has to WATCH these rather than be told about them,
+ * and why the list is exactly three long: they are the three s5l_*_t sub-
+ * structs a host is handed a pointer to without the machine that owns them.
+ *
+ * uart0's receive FIFO is deliberately absent. Its line is 24 and s5l8900_tick
+ * does not connect it (see the uart4 block there), so a byte pushed into it
+ * cannot change any level and watching it would be watching nothing.
+ */
+static uint32_t ext_inputs(const s5l8900_t *m) {
+    return (uint32_t)m->uart4.rx_count
+         | ((uint32_t)m->buttons.pressed << 8)
+         | ((uint32_t)(m->mtz2.atn ? 1u : 0u) << 16)
+         | ((uint32_t)s5l_usbotg_irq(&m->usbotg) << 17);
+}
+
+static void active_clock_reset_anchor(s5l8900_t *m) {
+    m->active_clock_last_host_ns = 0u;
+    m->active_clock_guest_ticks_since_sync = 0u;
+    m->active_clock_fraction = 0u;
+    m->active_clock_idle_oversleep_ns = 0u;
+    m->active_clock_idle_credit_ticks = 0u;
+    m->active_clock_idle_repaid_ticks = 0u;
+    m->active_clock_anchor_valid = false;
+}
+
+/*
+ * A physical input and the work it causes are one causal interval. Active host
+ * time remains enabled at first, because normal transitions need real-time UI
+ * timer cadence. If the interval is still not quiescent after the guarded host
+ * deadline, active_host_clock_sync() engages the instruction-clocked shield
+ * before the guest's own much later idle deadline can overtake slow CPU work.
+ */
+static void active_clock_begin_input_guard(s5l8900_t *m) {
+    if (!m || !m->active_host_now) return;
+    active_clock_counter_add(&m->active_clock_input_guards, 1u);
+    m->active_clock_input_guard_host_ns = 0u;
+    m->active_clock_input_guard = true;
+    m->active_clock_input_guard_host_valid = false;
+    m->active_clock_deadline_shield = false;
+    active_clock_reset_anchor(m);
+}
+
+static void active_clock_quiesce_input_guard(s5l8900_t *m) {
+    if (!m || !m->active_clock_input_guard) return;
+    active_clock_counter_add(&m->active_clock_input_guard_quiesces, 1u);
+    m->active_clock_input_guard_host_ns = 0u;
+    m->active_clock_input_guard = false;
+    m->active_clock_input_guard_host_valid = false;
+    m->active_clock_deadline_shield = false;
+    active_clock_reset_anchor(m);
+}
+
+static void s5l8900_refresh(s5l8900_t *m, uint32_t tb);
+
+void s5l8900_tick(s5l8900_t *m, uint32_t ticks) {
+    /* VMEngine injects a touch through the nested controller and immediately
+     * asks for this zero-tick refresh. Observe ATN before refresh records it in
+     * ext_seen; waiting until the next s5l8900_run() would miss the real app
+     * path. A falling ATN is guest consumption, not new host work. */
+    const uint32_t touch_atn = UINT32_C(1) << 16;
+    uint32_t inputs_at_entry = ext_inputs(m);
+    if (m->active_host_now &&
+        (inputs_at_entry & touch_atn) != 0u &&
+        (m->ext_seen & touch_atn) == 0u)
+        active_clock_begin_input_guard(m);
+
+    /*
+     * Convert elapsed emulated CPU-clock ticks into timebase ticks at the
+     * guest's own CPU:timebase ratio, carrying the remainder so it stays exact
+     * rather than drifting. Active execution contributes one such tick per
+     * retired instruction; WFI contributes elapsed idle ticks without
+     * changing cpu.cycles. Feeding ticks straight into the timebase runs guest
+     * time ~68x fast and livelocks the kernel's decrementer.
+     */
+    if (m->active_host_now && ticks) {
+        if (UINT64_MAX - m->active_clock_guest_ticks_since_sync < ticks)
+            m->active_clock_guest_ticks_since_sync = UINT64_MAX;
+        else
+            m->active_clock_guest_ticks_since_sync += ticks;
+    }
+
+    uint32_t tb = ticks;
+    if (m->cpu_hz && m->tb_hz) {
+        m->tb_accum += (uint64_t)ticks * m->tb_hz;
+        /*
+         * THE EARLY OUT, and the whole reason this function is affordable per
+         * instruction. See `level_dirty` in soc.h for the measurement and for
+         * why the rest of this function is idempotent over unchanged inputs.
+         *
+         * Four conditions, and each is load-bearing:
+         *
+         *   tb_accum < cpu_hz   no timebase tick elapsed, so every `tb`
+         *                       below would be 0 and every device's advance a
+         *                       no-op. At 412:6 this holds for 68 of every 69
+         *                       calls, which is where the time goes.
+         *   !level_dirty        no guest access has touched a device since the
+         *                       last refresh, so re-deriving the levels would
+         *                       reproduce the ones already there.
+         *   ext_inputs == seen  and neither has a host, on the three inputs it
+         *                       can reach behind the bus. Four loads; see
+         *                       ext_inputs() above.
+         *   ticks               a caller asking for zero ticks is asking for a
+         *                       refresh and nothing else; that is the only
+         *                       reason to call with zero, and both WFI and the
+         *                       host injection paths depend on it.
+         *
+         * The modulo below is skipped rather than deferred: tb_accum is
+         * already less than cpu_hz here, so `tb_accum %= cpu_hz` would not
+         * change it. Time is still carried exactly — the accumulator was
+         * advanced above, before this returns.
+         *
+         * g_tick_eager is the A/B switch, and it is here rather than around
+         * the whole function so that "eager" means the pre-change code path
+         * exactly: same conversion, same order, same everything below.
+         */
+        if (ticks && !m->level_dirty && !g_tick_eager &&
+            m->tb_accum < m->cpu_hz && inputs_at_entry == m->ext_seen) return;
+        tb = (uint32_t)(m->tb_accum / m->cpu_hz);
+        m->tb_accum %= m->cpu_hz;
+    }
+
+    s5l8900_refresh(m, tb);
+}
+
+#define S5L_POWER_TRACE_SECONDS UINT64_C(30)
+
+typedef enum {
+    POWER_TRACE_RECORD_FORCE = 0,
+    POWER_TRACE_RECORD_CHANGE,
+    POWER_TRACE_RECORD_EVENT_OR_CHANGE
+} power_trace_record_mode_t;
+
+static uint8_t power_trace_gpio(const s5l_gpioic_t *gpioic,
+                                unsigned line) {
+    if (!gpioic || line >= S5L_GPIOIC_LINES) return 0u;
+    unsigned group = line >> 5;
+    uint32_t bit = UINT32_C(1) << (line & 31u);
+    uint8_t flags = 0u;
+    if (gpioic->raw[group] & bit) flags |= S5L_POWER_TRACE_GPIO_RAW;
+    if (gpioic->stat[group] & bit) flags |= S5L_POWER_TRACE_GPIO_PENDING;
+    if (gpioic->en[group] & bit) flags |= S5L_POWER_TRACE_GPIO_ENABLED;
+    if (gpioic->type[group] & bit) flags |= S5L_POWER_TRACE_GPIO_LEVEL_TYPE;
+    if (gpioic->level[group] & bit)
+        flags |= S5L_POWER_TRACE_GPIO_ASSERT_HIGH;
+    if (gpioic->driven[group] & bit) flags |= S5L_POWER_TRACE_GPIO_DRIVEN;
+    return flags;
+}
+
+static s5l_power_trace_entry_t power_trace_capture(const s5l8900_t *m) {
+    s5l_power_trace_entry_t entry;
+    memset(&entry, 0, sizeof entry);
+    if (!m) return entry;
+
+    entry.cpu_cycles = m->cpu.cycles;
+    entry.cpu_pc = m->cpu.r[15];
+    entry.buttons_pressed = m->buttons.pressed;
+    entry.pmu_shutdown = m->pmu.regs[PCF50635_OOCSHDWN];
+    entry.pmu_int2 = m->pmu.regs[PCF50635_INT2];
+    entry.pmu_int2_mask = m->pmu.regs[PCF50635_INT2MASK];
+    entry.power_gpio = power_trace_gpio(
+        &m->gpioic, s5l_button_line(S5L_BUTTON_HOLD));
+    entry.pmu_gpio = power_trace_gpio(&m->gpioic, S5L_GPIOIC_LINE_PMU);
+    if (m->clcd.scanning) entry.clcd |= S5L_POWER_TRACE_CLCD_SCANNING;
+    if (s5l_clcd_running(&m->clcd))
+        entry.clcd |= S5L_POWER_TRACE_CLCD_RUNNING;
+    if (m->cpu.irq_line) entry.cpu_lines |= S5L_POWER_TRACE_CPU_IRQ;
+    if (m->cpu.fiq_line) entry.cpu_lines |= S5L_POWER_TRACE_CPU_FIQ;
+    return entry;
+}
+
+static uint16_t power_trace_changes(
+        const s5l_power_trace_entry_t *entry,
+        const s5l_power_trace_entry_t *before) {
+    if (!entry || !before) return S5L_POWER_TRACE_CHANGE_ALL;
+    uint16_t changes = 0u;
+    if (entry->buttons_pressed != before->buttons_pressed)
+        changes |= S5L_POWER_TRACE_CHANGE_BUTTONS;
+    if (entry->pmu_shutdown != before->pmu_shutdown)
+        changes |= S5L_POWER_TRACE_CHANGE_SHUTDOWN;
+    if (entry->pmu_int2 != before->pmu_int2)
+        changes |= S5L_POWER_TRACE_CHANGE_INT2;
+    if (entry->pmu_int2_mask != before->pmu_int2_mask)
+        changes |= S5L_POWER_TRACE_CHANGE_INT2MASK;
+    if (entry->power_gpio != before->power_gpio)
+        changes |= S5L_POWER_TRACE_CHANGE_POWER_GPIO;
+    if (entry->pmu_gpio != before->pmu_gpio)
+        changes |= S5L_POWER_TRACE_CHANGE_PMU_GPIO;
+    if (entry->clcd != before->clcd)
+        changes |= S5L_POWER_TRACE_CHANGE_CLCD;
+    if (entry->cpu_lines != before->cpu_lines)
+        changes |= S5L_POWER_TRACE_CHANGE_CPU_LINES;
+    return changes;
+}
+
+static const s5l_power_trace_entry_t *power_trace_last(
+        const s5l8900_t *m) {
+    if (!m || !m->power_trace_sequence) return NULL;
+    uint64_t index = (m->power_trace_sequence - UINT64_C(1)) %
+                     S5L_POWER_TRACE_HISTORY;
+    const s5l_power_trace_entry_t *entry = &m->power_trace[index];
+    return entry->sequence == m->power_trace_sequence ? entry : NULL;
+}
+
+static void power_trace_record(s5l8900_t *m, s5l_power_trace_event_t event,
+                               power_trace_record_mode_t mode) {
+    if (!m || !m->power_trace_ticks_left) return;
+
+    const s5l_power_trace_entry_t *before = power_trace_last(m);
+    s5l_power_trace_entry_t entry = power_trace_capture(m);
+    entry.changes = power_trace_changes(&entry, before);
+    entry.event = (uint8_t)event;
+
+    /* IRQ/FIQ are retained as context on every useful entry, but are not a
+     * useful trigger by themselves.  The sleeping kernel can pulse them many
+     * times per millisecond; recording each pulse overwrites the bounded ring
+     * before a physical-device frontend can publish the wake boundary. */
+    if (mode == POWER_TRACE_RECORD_CHANGE &&
+        (entry.changes & ~S5L_POWER_TRACE_CHANGE_CPU_LINES) == 0u) return;
+    if (mode == POWER_TRACE_RECORD_EVENT_OR_CHANGE &&
+        entry.changes == 0u && before && before->event == entry.event) return;
+
+    uint64_t sequence = m->power_trace_sequence == UINT64_MAX
+        ? UINT64_MAX : m->power_trace_sequence + UINT64_C(1);
+    entry.sequence = sequence;
+    m->power_trace[(sequence - UINT64_C(1)) % S5L_POWER_TRACE_HISTORY] = entry;
+    m->power_trace_sequence = sequence;
+}
+
+static void power_trace_arm(s5l8900_t *m) {
+    if (!m) return;
+    uint64_t hz = m->tb_hz ? m->tb_hz : S5L8900_TB_HZ;
+    m->power_trace_ticks_left = hz * S5L_POWER_TRACE_SECONDS;
+}
+
+static void power_trace_observe(s5l8900_t *m, uint32_t elapsed_tb) {
+    if (!m || !m->power_trace_ticks_left) return;
+    power_trace_record(m, S5L_POWER_TRACE_EVENT_STATE,
+                       POWER_TRACE_RECORD_CHANGE);
+    if ((uint64_t)elapsed_tb >= m->power_trace_ticks_left)
+        m->power_trace_ticks_left = 0u;
+    else
+        m->power_trace_ticks_left -= elapsed_tb;
+}
+
+static bool wake_from_pmu_power_state(s5l8900_t *m, bool onkey) {
+    /* XNU copied its reset trampoline to the first retained DRAM page before
+     * writing OOCSHDWN, then entered an intentional infinite branch. ONKEY
+     * powers the ARM core back up from reset; it is not an IRQ capable of
+     * escaping that branch. This machine has no low-address DRAM alias, so the
+     * hardware reset vector is represented by the actual DRAM base. */
+    power_trace_arm(m);
+    power_trace_record(m, S5L_POWER_TRACE_EVENT_WAKE_BEGIN,
+                       POWER_TRACE_RECORD_FORCE);
+    if (onkey)
+        s5l_pcf50635_wake_onkey(&m->pmu);
+    else if (!s5l_pcf50635_wake_gpio(&m->pmu))
+        return false;
+
+    uint64_t cycles = m->cpu.cycles;
+    arm_reset(&m->cpu, &m->bus);
+    m->cpu.cycles = cycles;
+    m->cpu.r[15] = m->ram_base;
+
+    /* CPU translation state changed discontinuously even though retained RAM
+     * did not. Flush host-derived execution state and detach the new guest
+     * instant from any pre-sleep host-clock anchor. Lifetime evidence counters
+     * remain intact, including the monotonic retired-instruction count above. */
+    s5l8900_static_a64_invalidate_derived(m);
+    m->wfi_pace_yield = false;
+    m->power_wait_fraction = 0u;
+    m->active_clock_last_host_ns = 0u;
+    m->active_clock_guest_ticks_since_sync = 0u;
+    m->active_clock_fraction = 0u;
+    m->active_clock_idle_oversleep_ns = 0u;
+    m->active_clock_idle_credit_ticks = 0u;
+    m->active_clock_idle_repaid_ticks = 0u;
+    m->active_clock_anchor_valid = false;
+    m->active_clock_input_guard_host_ns = 0u;
+    m->active_clock_input_guard = false;
+    m->active_clock_input_guard_host_valid = false;
+    m->active_clock_deadline_shield = false;
+    m->level_dirty = true;
+    s5l8900_tick(m, 0u);
+    power_trace_record(m, S5L_POWER_TRACE_EVENT_WAKE_RESET,
+                       POWER_TRACE_RECORD_FORCE);
+    return true;
+}
+
+bool s5l8900_wake_from_standby(s5l8900_t *m) {
+    if (!m || !s5l_pcf50635_in_standby(&m->pmu)) return false;
+    return wake_from_pmu_power_state(m, true);
+}
+
+bool s5l8900_wake_from_hibernation(s5l8900_t *m) {
+    if (!m || !s5l_pcf50635_in_hibernation(&m->pmu)) return false;
+    return wake_from_pmu_power_state(m, true);
+}
+
+bool s5l8900_set_button(s5l8900_t *m, unsigned which, bool pressed) {
+    if (!m) return false;
+
+    bool in_standby = s5l_pcf50635_in_standby(&m->pmu);
+    bool in_hibernation = s5l_pcf50635_in_hibernation(&m->pmu);
+    if (!in_standby && !in_hibernation) {
+        /* AppleM68Buttons reads the PMU wake reason before dispatching the
+         * synthetic Power press. Do not let the host's queued release overtake
+         * that read: once INT2 has cleared, the release proceeds through the
+         * ordinary GPIO debounce path below. */
+        if (which == S5L_BUTTON_HOLD && !pressed &&
+            s5l_buttons_held(&m->buttons, S5L_BUTTON_HOLD) &&
+            (m->pmu.regs[PCF50635_INT2] &
+             PCF50635_INT2_WAKE_BUTTON_HOLD) != 0u) {
+            m->buttons.refused++;
+            power_trace_arm(m);
+            power_trace_record(m, S5L_POWER_TRACE_EVENT_RELEASE_WAIT,
+                               POWER_TRACE_RECORD_EVENT_OR_CHANGE);
+            return false;
+        }
+        uint64_t edges_before = m->buttons.edges;
+        bool accepted = s5l_buttons_set(&m->buttons, &m->gpio, &m->gpioic,
+                                        which, pressed);
+        if (accepted) {
+            /* Repeating the electrical state already present is accepted by
+             * the public API, but it did not deliver new work to the guest. */
+            if (m->buttons.edges != edges_before)
+                active_clock_begin_input_guard(m);
+            s5l8900_tick(m, 0u);
+            if (which == S5L_BUTTON_HOLD) {
+                power_trace_arm(m);
+                power_trace_record(
+                    m, pressed ? S5L_POWER_TRACE_EVENT_HOST_PRESS
+                               : S5L_POWER_TRACE_EVENT_HOST_RELEASE,
+                    POWER_TRACE_RECORD_FORCE);
+            }
+        } else if (which == S5L_BUTTON_HOLD) {
+            power_trace_arm(m);
+            power_trace_record(m, S5L_POWER_TRACE_EVENT_HOST_REFUSED,
+                               POWER_TRACE_RECORD_EVENT_OR_CHANGE);
+        }
+        return accepted;
+    }
+
+    if (which >= S5L_BUTTON_COUNT) {
+        m->buttons.refused++;
+        return false;
+    }
+
+    /* Home resumes Auto-Lock, but does not power on a shut-down board. Its
+     * device-tree entry has no function-wake_button_menu PMU STAT selector;
+     * after retained reset AppleM68Buttons re-enables its ordinary GPIO source
+     * (0xc065a110), which must still see the held electrical press. */
+    bool home_wake = which == S5L_BUTTON_MENU && pressed &&
+                     in_hibernation && !in_standby;
+    /* Other powered-down transitions cannot be serviced. Consume them without
+     * inventing GPIO activity or blocking the real wake source in the FIFO. */
+    if (!home_wake && (which != S5L_BUTTON_HOLD || !pressed)) {
+        m->buttons.sets++;
+        if (which == S5L_BUTTON_HOLD) {
+            power_trace_arm(m);
+            power_trace_record(m, S5L_POWER_TRACE_EVENT_HOST_RELEASE,
+                               POWER_TRACE_RECORD_FORCE);
+        }
+        return true;
+    }
+
+    power_trace_arm(m);
+    power_trace_record(m, S5L_POWER_TRACE_EVENT_HOST_PRESS,
+                       POWER_TRACE_RECORD_FORCE);
+
+    /* The Power switch has two independent guest-visible paths: PMU wake
+     * status and GPIO line 45. The earlier consumed-edge model treated the PMU
+     * status as if it had also serviced the GPIO controller; it had been built
+     * while STAT was mapped to ONKEYR, although the exact shipped STAT method
+     * checks EXTON1R. AppleM68Buttons' own state bitfield suppresses a GPIO
+     * dispatch that repeats its PMU-derived pressed state, but GPIOIC still
+     * needs to service and auto-flip the real line before it can catch release.
+     * Preserve that physical transition across the retained reset. Home has
+     * only the GPIO side; neither its press nor release changes Power state. */
+    m->buttons.sets++;
+    if (!s5l_buttons_held(&m->buttons, which)) {
+        m->buttons.pressed |= (uint8_t)(1u << which);
+        m->buttons.edges++;
+        s5l_buttons_apply(&m->buttons, &m->gpio, &m->gpioic);
+    }
+
+    bool woke;
+    if (home_wake)
+        woke = wake_from_pmu_power_state(m, false);
+    else
+        woke = in_hibernation ? s5l8900_wake_from_hibernation(m)
+                              : s5l8900_wake_from_standby(m);
+    if (woke) {
+        active_clock_begin_input_guard(m);
+    } else {
+        power_trace_record(m, S5L_POWER_TRACE_EVENT_WAKE_FAILED,
+                           POWER_TRACE_RECORD_FORCE);
+    }
+    return woke;
+}
+
+/* One implementation of the observable device work, kept out of the public
+ * clock converter's common path. Besides avoiding duplication, this split
+ * leaves s5l8900_tick() small enough for an optimizing compiler to inline its
+ * ticks=1 conversion and early-out into s5l8900_run() without also pulling the
+ * entire device graph into the interpreter loop. */
+static void s5l8900_refresh(s5l8900_t *m, uint32_t tb) {
+    m->level_dirty = false;
+
+    /* Devices advance, then the controllers recompute what the CPU sees. */
+    bool timer_irq = s5l_timer_tick(&m->timer, tb);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_TIMER, timer_irq);
+
+    bool clcd_irq = s5l_clcd_tick(&m->clcd, tb);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_CLCD, clcd_irq);
+
+    /*
+     * The MBX completion line. Like i2c and spi below, the device completes
+     * inside the store that kicks it, so the status is already pending by the
+     * time this runs and a zero-tick refresh is enough for the guest to see
+     * both the assertion and its own acknowledge.
+     */
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_MBX, s5l_mbx_irq(&m->mbx));
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_USB_OTG,
+                     s5l_usbotg_irq(&m->usbotg));
+
+    bool tvout_irq = s5l_tvout_tick(&m->tvout, tb);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_TVOUT, tvout_irq);
+
+    /* I2C transfers complete synchronously with their command store, then
+     * remain level-asserted until the driver's W1C acknowledge. A zero-tick
+     * refresh is therefore enough for WFI to observe both assertion and
+     * deassertion without advancing guest time. */
+    s5l_pcf50635_tick(&m->pmu, tb);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_I2C0,
+                     s5l_i2c_irq(&m->i2c[0]));
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_I2C1,
+                     s5l_i2c_irq(&m->i2c[1]));
+
+    /* SPI words complete inside the store that pushes them, for the same reason
+     * and with the same consequence: a zero-tick refresh is all WFI needs to
+     * observe both the assertion and the guest's W1C acknowledge. */
+    s5l_spi_irq_note(&m->spi[0]);
+    s5l_spi_irq_note(&m->spi[1]);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_SPI0, s5l_spi_irq(&m->spi[0]));
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_SPI1, s5l_spi_irq(&m->spi[1]));
+
+    /*
+     * uart4's receive FIFO — the ONLY interrupt in this machine whose source is
+     * outside the machine. It is a level, asserted while a byte the host pushed
+     * is still waiting, and it drops when the guest drains URXH.
+     *
+     * uart0 runs the identical model and has an identical FIFO, and is
+     * deliberately NOT wired: it is the kprintf console, its VIC line is 24,
+     * and nothing in this project has any business injecting console input.
+     * A line nobody can assert is worse than no line at all, so it does not get
+     * one until something needs it.
+     *
+     * On a run with no host peer this is a refresh of `false` over `false`
+     * forever: s5l_uart_rx_push() is the only producer and core/ never calls
+     * it. core/tests/test_uart4.c pins that.
+     */
+    /* Finalized after the PL080s below. A receive DMA can consume through its
+     * watermark, fire the collapsed legacy idle timeout, and drain the released
+     * FIFO tail in this same refresh; no guest instruction runs in between. */
+
+    /*
+     * The two DMA controllers, and the ONLY device in this machine that reaches
+     * back through the bus while it runs. It is given `&m->bus` rather than
+     * holding it, so that the pointer it uses is always the one installed NOW:
+     * tools/bootkernel.c interposes on m->bus AFTER s5l8900_init returns, and a
+     * copy taken at init would route every DMA store past that interposer —
+     * which is precisely the tap the guest's audio capture is listening on.
+     *
+     * This is before the GPIO cascade for no reason other than that both DMAC
+     * lines are VIC0's and neither feeds the cascade; the order is free.
+     */
+    /* Before the controllers, so a port that can drain has drained and the
+     * request line below reads true rather than stale. */
+    for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) s5l_spi_step(&m->spi[i]);
+
+    /* Active-host-clock catch-up can span many samples, even with DMA IRQs
+     * masked. Interleave ONLY PCM and DMA at sample edges; advancing the FIFO
+     * for the whole interval before servicing DMA would manufacture underruns.
+     * The rest of the device graph still advances once per refresh. */
+    s5l_i2s_audio_tick(&m->i2s[0], &m->codec, 0, m->tb_hz);
+    uint32_t audio_remaining = tb;
+    unsigned audio_slices = 0;
+    bool audio_clock_edge = false;
+    do {
+        for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
+            m->dma_access_active = true;
+            bool dmac_irq = s5l_pl080_run(&m->dmac[i], &m->bus,
+                                          dma_request_ready, m);
+            m->dma_access_active = false;
+            s5l_vic_set_line(&m->vic[0],
+                             i == 0u ? S5L8900_IRQ_DMAC0 : S5L8900_IRQ_DMAC1,
+                             dmac_irq);
+        }
+        if (!audio_remaining) break;
+        uint32_t step = s5l_i2s_audio_next(&m->i2s[0], m->tb_hz);
+        if (!step || step > audio_remaining) {
+            audio_clock_edge |= s5l_i2s_audio_tick(&m->i2s[0], &m->codec,
+                                                  audio_remaining, m->tb_hz);
+            break; /* no sample edge, so no new DMA request */
+        }
+        if (audio_slices++ >= 4096u)
+            step = audio_remaining;
+        audio_clock_edge |= s5l_i2s_audio_tick(&m->i2s[0], &m->codec, step, m->tb_hz);
+        audio_remaining -= step;
+    } while (true);
+
+    /* Edge-latched GPIO: coalesce elapsed clock edges into one pending bit,
+     * not one interrupt per sample after the driver has masked the line. */
+    if (audio_clock_edge) {
+        s5l_gpioic_set_line(&m->gpioic, 134u, false);
+        s5l_gpioic_set_line(&m->gpioic, 134u, true);
+        s5l_gpioic_set_line(&m->gpioic, 134u, false);
+    }
+
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_UART4,
+                     s5l_uart_rx_irq(&m->uart4));
+
+    /*
+     * The GPIO interrupt cascade. Seven group outputs, seven VIC lines, and
+     * two of those lines are 32 and 33 — the FIRST sources this machine has
+     * ever routed to VIC1. s5l_vic_set_line() takes a per-controller 0-31 line
+     * and silently drops anything larger, so the flat device-tree number has
+     * to be split here; passing 33 to vic[0] would enable nothing and fail
+     * without a symptom.
+     */
+    /* Device interrupt lines first, so the cascade below sees them in the same
+     * refresh. */
+    /* `/arm-io/i2c0/pmu` declares `interrupts {85, 1}`: GPIOIC line 85,
+     * level-sensitive and active low. This is the PMU chip's INT_N output,
+     * distinct from the I2C controller's transfer-complete VIC interrupt. */
+    s5l_gpioic_set_line(&m->gpioic, S5L_GPIOIC_LINE_PMU,
+                        !s5l_pcf50635_irq(&m->pmu));
+
+    /* Touch attention is asserted only when the device has a frame waiting,
+     * which nothing produces yet. */
+    s5l_gpioic_set_line(&m->gpioic, S5L_GPIOIC_LINE_MULTITOUCH,
+                        s5l_mtz2_irq(&m->mtz2));
+
+    /*
+     * The five switches, refreshed for the same reason: the guest's own stores
+     * to INTTYPE and INTLEVEL change what a level line asserts, and a switch
+     * that has not moved must still be presenting its level when that happens.
+     * s5l_buttons_set() has already driven any change at the exact instruction
+     * the host chose, so this is idempotent — re-driving an unchanged level
+     * latches nothing on either an edge line or a level one.
+     */
+    s5l_buttons_apply(&m->buttons, &m->gpio, &m->gpioic);
+
+    for (unsigned g = 0; g < S5L_GPIOIC_GROUPS; g++) {
+        unsigned line = s5l_gpioic_cascade(g);
+        if (line >= 32u * S5L8900_VIC_COUNT) continue;
+        s5l_vic_set_line(&m->vic[line / 32u], line % 32u,
+                         s5l_gpioic_group_irq(&m->gpioic, g));
+    }
+
+    /*
+     * BOTH VICs drive the CPU.
+     *
+     * Only VIC0 used to, which was fine while VIC0 was the only one mapped. It
+     * is not defensible now: the device tree numbers interrupts flat across the
+     * pair — /arm-io/gpio lists lines 0x20 and 0x21, /arm-io/wdt 0x33,
+     * /arm-io/sdio 0x2a, /arm-io/edgeic 0x23 and 0x29 — and every one of those
+     * is past VIC0's 32 lines, so it lives on VIC1. Leaving VIC1's outputs
+     * disconnected would mean the watchdog, the SD controller and the GPIO
+     * interrupt controller could be correctly programmed, correctly asserted,
+     * and still never reach the CPU: a silent failure, and precisely the kind
+     * this core exists to avoid.
+     *
+     * OR-ing the two is the standard PL192 cascade. Nothing asserts a VIC1 line
+     * today, so this changes no behaviour now; it removes a trap for the next
+     * device that needs a line above 31.
+     */
+    bool irq = false, fiq = false;
+    for (unsigned i = 0; i < S5L8900_VIC_COUNT; i++) {
+        irq |= s5l_vic_irq(&m->vic[i]);
+        fiq |= s5l_vic_fiq(&m->vic[i]);
+    }
+    m->cpu.irq_line = irq;
+    m->cpu.fiq_line = fiq;
+
+    /* Sampled LAST, not first: s5l_buttons_apply() above can move a pin whose
+     * watcher is s5l_mtz2_reset_pin(), and that clears the attention line this
+     * word carries. Recording what the refresh started from would leave the
+     * next call convinced a host had moved it. */
+    m->ext_seen = ext_inputs(m);
+    power_trace_observe(m, tb);
+}
+
+/* No execution path may defer the device graph across the first timebase edge
+ * the literal arm_step()+s5l8900_tick(1) loop would have observed. Dirty levels
+ * and host inputs force the ordinary one-instruction path first. This bound is
+ * shared by the signed engine and the interpreter batch below; it is timing
+ * policy, not an engine-specific optimization.
+ */
+static unsigned retirement_batch_limit(const s5l8900_t *m,
+                                        unsigned remaining) {
+    uint64_t until_edge;
+    if (!remaining || g_tick_eager || m->level_dirty ||
+        ext_inputs(m) != m->ext_seen || !m->cpu_hz || !m->tb_hz ||
+        m->tb_hz > m->cpu_hz || m->tb_accum >= m->cpu_hz)
+        return 0u;
+
+    until_edge = ((uint64_t)m->cpu_hz - m->tb_accum + m->tb_hz - 1u) /
+                 m->tb_hz;
+    if (until_edge < remaining) remaining = (unsigned)until_edge;
+    return remaining;
+}
+
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+/* Only a receive channel stalled on an empty, host/guest-fed FIFO is proved
+ * inert without running PL080. Invalid descriptors and every other enabled
+ * channel retain the literal timebase boundary. This predicate does not call
+ * dma_request_ready: UART4's request callback may release its idle timeout. */
+static bool region_dma_inert(const s5l8900_t *m) {
+    for (unsigned i = 0u; i < S5L8900_SPI_COUNT; i++)
+        if (m->spi[i].tx_level) return false;
+    for (unsigned d = 0u; d < S5L8900_DMAC_COUNT; d++) {
+        const s5l_pl080_t *dma = &m->dmac[d];
+        if (!(dma->config & PL080_CONFIG_EN)) continue;
+        for (unsigned c = 0u; c < S5L_PL080_CHANNELS; c++) {
+            const s5l_pl080_chan_t *ch = &dma->ch[c];
+            if ((ch->cfg & (PL080_CFG_EN | PL080_CFG_HALT)) != PL080_CFG_EN)
+                continue;
+            unsigned sw = (ch->ctrl >> PL080_CTRL_SWIDTH_SHIFT) &
+                          PL080_CTRL_WIDTH_MASK;
+            unsigned dw = (ch->ctrl >> PL080_CTRL_DWIDTH_SHIFT) &
+                          PL080_CTRL_WIDTH_MASK;
+            unsigned n = ch->ctrl & PL080_CTRL_SIZE_MASK;
+            if (sw > 2u || dw > 2u || !n ||
+                ((n << sw) & ((1u << dw) - 1u)) != 0u ||
+                (ch->cfg & PL080_CFG_FLOW_MASK) != (2u << PL080_CFG_FLOW_SHIFT))
+                return false;
+            if (ch->src == S5L8900_UART0_BASE + UART_URXH) {
+                if (m->uart0.rx_count) return false;
+            } else if (ch->src == S5L8900_UART4_BASE + UART_URXH) {
+                if (m->uart4.rx_count) return false;
+            } else {
+                static const uint32_t bases[] = {
+                    S5L8900_SPI0_BASE, S5L8900_SPI1_BASE, S5L8900_SPI2_BASE
+                };
+                bool empty = false;
+                for (unsigned s = 0u; s < S5L8900_SPI_COUNT; s++)
+                    if (ch->src == bases[s] + SPI_RXDATA && !m->spi[s].rx_level)
+                        empty = true;
+                if (!empty) return false;
+            }
+        }
+    }
+    return true;
+}
+
+static unsigned compact_event_batch_limit(const s5l8900_t *m,
+                                           unsigned remaining) {
+    if (!remaining || g_tick_eager || m->level_dirty ||
+        ext_inputs(m) != m->ext_seen || !m->cpu_hz || !m->tb_hz ||
+        m->tb_hz > m->cpu_hz || m->tb_accum >= m->cpu_hz)
+        return 0u;
+    if (m->power_trace_ticks_left || !region_dma_inert(m))
+        return retirement_batch_limit(m, remaining);
+    if (remaining > S5LBOX_STATIC_A64_COMPACT_REGION_INSNS)
+        remaining = S5LBOX_STATIC_A64_COMPACT_REGION_INSNS;
+
+    /* The same event inventory as WFI, but WITHOUT its VIC mask filter:
+     * running code may observe a device whose interrupt is currently masked.
+     * Synchronous devices are inert until fallback; PMU RTC/free-running
+     * counters advance algebraically before any MMIO read. Unknown event
+     * sources fall back to the old first-timebase-edge contract. */
+    for (unsigned i = 0u; i < NWAKE_SOURCES; i++) {
+        uint32_t ticks = 0u;
+        if (!WAKE_SOURCES[i].next_edge)
+            return retirement_batch_limit(m, remaining);
+        s5l_wake_kind_t kind = WAKE_SOURCES[i].next_edge(m, &ticks);
+        if (kind == S5L_WAKE_NEVER) continue;
+        if (kind != S5L_WAKE_AT || !ticks)
+            return retirement_batch_limit(m, remaining);
+        /* Compare before multiplying the possibly uint32-wide deadline.
+         * The remaining region spans at most 4096 timebase ticks. */
+        uint64_t last = (m->tb_accum + (uint64_t)remaining * m->tb_hz) /
+                        m->cpu_hz;
+        if (ticks > last) continue;
+        uint64_t distance = (uint64_t)ticks * m->cpu_hz - m->tb_accum;
+        unsigned bound = (unsigned)((distance + m->tb_hz - 1u) / m->tb_hz);
+        if (bound < remaining) remaining = bound;
+    }
+    return remaining;
+}
+#endif
+
+/*
+ * Active wall-clock mode no longer needs an artificial retirement boundary at
+ * each 6 MHz timebase edge: the next host sample advances every elapsed edge
+ * together.  Device dirtiness and host inputs remain immediate boundaries.
+ * The fixed ceiling limits both interrupt latency and clock callback cost.
+ */
+static unsigned run_retirement_batch_limit(const s5l8900_t *m,
+                                           unsigned remaining,
+                                           bool active_clock) {
+    if (!active_clock) {
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+        if (s5l8900_static_a64_uses_event_regions(m))
+            return compact_event_batch_limit(m, remaining);
+#endif
+        return retirement_batch_limit(m, remaining);
+    }
+    if (!remaining || m->level_dirty || ext_inputs(m) != m->ext_seen)
+        return 0u;
+    if (remaining > S5L8900_ACTIVE_CLOCK_BATCH_INSNS)
+        remaining = S5L8900_ACTIVE_CLOCK_BATCH_INSNS;
+    return remaining;
+}
+
+/*
+ * Collapse only the calls to s5l8900_tick(), never ARM execution itself.
+ *
+ * User mode is the safety boundary: WFI and privileged host SVC can advance
+ * device time from inside arm_step(), while User code cannot. A pre-step hook
+ * can have a target anywhere in the interval, and the signed engine owns its
+ * own boundary contract, so either policy disables this path completely.
+ */
+static unsigned interpreter_tick_batch_limit(const s5l8900_t *m,
+                                              unsigned remaining,
+                                              bool active_clock) {
+    if ((m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
+        m->pre_step_hook)
+        return 0u;
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+    if (s5l8900_static_a64_is_enabled(m)) return 0u;
+#endif
+    return run_retirement_batch_limit(m, remaining, active_clock);
+}
+
+
+static void active_clock_counter_add(uint64_t *counter, uint64_t value) {
+    if (UINT64_MAX - *counter < value) *counter = UINT64_MAX;
+    else *counter += value;
+}
+
+/*
+ * Convert host nanoseconds plus the carried billionth-of-a-tick fraction into
+ * whole guest CPU ticks without multiplying the potentially unbounded whole
+ * interval by cpu_hz.  false means the whole-tick result cannot fit uint64_t;
+ * callers can still apply their bounded catch-up policy without trusting a
+ * wrapped value.
+ */
+static bool active_clock_elapsed_ticks(uint64_t elapsed_ns, uint32_t cpu_hz,
+                                       uint64_t fraction,
+                                       uint64_t *whole_ticks,
+                                       uint64_t *next_fraction) {
+    const uint64_t billion = UINT64_C(1000000000);
+    uint64_t seconds = elapsed_ns / billion;
+    uint64_t sub_ns = elapsed_ns % billion;
+
+    if (!cpu_hz || !whole_ticks || !next_fraction || fraction >= billion ||
+        seconds > UINT64_MAX / cpu_hz)
+        return false;
+
+    uint64_t whole = seconds * cpu_hz;
+    /* sub_ns < 1e9 and cpu_hz is uint32_t, so this product plus fraction is
+     * below 4.3e18 and cannot overflow uint64_t. */
+    uint64_t scaled_sub = sub_ns * cpu_hz + fraction;
+    uint64_t carry = scaled_sub / billion;
+    if (whole > UINT64_MAX - carry) return false;
+
+    *whole_ticks = whole + carry;
+    *next_fraction = scaled_sub % billion;
+    return true;
+}
+
+/*
+ * Synchronize active guest time to one monotonic host sample. `fallback_ticks`
+ * are the successfully retired instructions not yet represented in guest
+ * time. If the host clock cannot provide a trustworthy sample, those ticks
+ * are applied through the old exact contract and the caller disables active
+ * timing for the rest of this run call.
+ */
+static bool active_host_clock_sync(s5l8900_t *m,
+                                   uint32_t fallback_ticks) {
+    uint64_t now_ns = 0u;
+    if (!m->active_host_now || !m->cpu_hz ||
+        !m->active_host_now(m->active_host_now_ctx, &now_ns) ||
+        (m->active_clock_anchor_valid &&
+         now_ns < m->active_clock_last_host_ns) ||
+        (m->active_clock_input_guard_host_valid &&
+         now_ns < m->active_clock_input_guard_host_ns)) {
+        active_clock_counter_add(&m->active_clock_failures, 1u);
+        m->active_clock_input_guard_host_ns = 0u;
+        m->active_clock_input_guard_host_valid = false;
+        active_clock_reset_anchor(m);
+        s5l8900_tick(m, fallback_ticks);
+        return false;
+    }
+
+    if (m->active_clock_input_guard &&
+        !m->active_clock_input_guard_host_valid) {
+        m->active_clock_input_guard_host_ns = now_ns;
+        m->active_clock_input_guard_host_valid = true;
+    }
+
+    if (m->active_clock_input_guard &&
+        !m->active_clock_deadline_shield &&
+        now_ns - m->active_clock_input_guard_host_ns >=
+            S5L8900_ACTIVE_CLOCK_INPUT_SHIELD_NS) {
+        active_clock_counter_add(&m->active_clock_deadline_shields, 1u);
+        m->active_clock_deadline_shield = true;
+        active_clock_reset_anchor(m);
+        s5l8900_tick(m, fallback_ticks);
+        return false;
+    }
+
+    if (!m->active_clock_anchor_valid) {
+        m->active_clock_last_host_ns = now_ns;
+        m->active_clock_guest_ticks_since_sync = 0u;
+        m->active_clock_fraction = 0u;
+        m->active_clock_idle_oversleep_ns = 0u;
+        m->active_clock_idle_credit_ticks = 0u;
+        m->active_clock_idle_repaid_ticks = 0u;
+        m->active_clock_anchor_valid = true;
+        /* Establish the same level/input boundary the first ordinary device
+         * tick in this run would have supplied, without manufacturing time. */
+        s5l8900_tick(m, 0u);
+        return true;
+    }
+
+    uint64_t elapsed_ns = now_ns - m->active_clock_last_host_ns;
+    m->active_clock_last_host_ns = now_ns;
+    uint64_t prior_fraction = m->active_clock_fraction;
+    uint64_t observed_ticks = m->active_clock_guest_ticks_since_sync;
+    /* Prepaid WFI time came from an earlier sample, not this host interval.
+     * Subtracting it here also preserves this wait's independently measured
+     * oversleep instead of accidentally charging the same credit twice. */
+    if (observed_ticks >= m->active_clock_idle_repaid_ticks)
+        observed_ticks -= m->active_clock_idle_repaid_ticks;
+    m->active_clock_idle_repaid_ticks = 0u;
+    uint64_t due_ticks = 0u, due_fraction = 0u;
+    uint64_t max_added_ticks = 0u, max_fraction = 0u;
+    bool converted = active_clock_elapsed_ticks(
+        elapsed_ns, m->cpu_hz, prior_fraction, &due_ticks, &due_fraction);
+    /* This conversion is guaranteed to fit: the interval is 8 ms and the
+     * frequency is uint32_t. Keeping it in the same helper pins the fraction
+     * semantics to the ordinary, unclamped path. */
+    bool max_converted = active_clock_elapsed_ticks(
+        S5L8900_ACTIVE_CLOCK_MAX_STEP_NS, m->cpu_hz, prior_fraction,
+        &max_added_ticks, &max_fraction);
+    uint64_t added_ticks = 0u;
+    bool clamp = !converted || !max_converted;
+
+    if (!clamp && due_ticks > observed_ticks) {
+        added_ticks = due_ticks - observed_ticks;
+        /* Cap only host time that the guest has not already advanced. Paced
+         * WFI ticks are observed above; clipping the raw host interval before
+         * subtracting them discarded normal scheduler oversleep every slice
+         * and made idle guest time fall progressively behind wall time. */
+        clamp = added_ticks > max_added_ticks ||
+                (added_ticks == max_added_ticks &&
+                 due_fraction > max_fraction);
+    }
+    if (clamp) {
+        added_ticks = max_added_ticks;
+        due_fraction = max_fraction;
+        m->active_clock_idle_credit_ticks = 0u;
+    }
+
+    /* Wall time is an upper bound, not permission to run the guest clock ahead
+     * of the work this host completed.  Without this second bound a 20 Minsn/s
+     * phone was credited 412 million CPU ticks each host second; timer
+     * deadlines then arrived faster than XNU could service them and foreground
+     * navigation never reached its next wait. Sustained CPU work still obeys
+     * that bound. Retain at most one slice for a later, proven idle interval;
+     * it may shorten a host sleep but can never accelerate busy execution. */
+    uint64_t retirement_cap =
+        (uint64_t)fallback_ticks *
+        m->active_clock_max_ticks_per_retirement;
+    /* Only time measured inside a successful host idle wait can supplement
+     * the CPU-work cap. No wait credit survives this synchronization. The
+     * residual 8 ms cap above still applies, including suspend-like sleeps. */
+    uint64_t idle_ticks = 0u, idle_fraction = 0u;
+    if (m->active_clock_idle_oversleep_ns &&
+        active_clock_elapsed_ticks(m->active_clock_idle_oversleep_ns,
+                                  m->cpu_hz, 0u, &idle_ticks, &idle_fraction))
+        retirement_cap += idle_ticks;
+    m->active_clock_idle_oversleep_ns = 0u;
+    if (added_ticks > retirement_cap) {
+        if (!clamp && m->wfi_host_sleep) {
+            uint64_t room = max_added_ticks > m->active_clock_idle_credit_ticks
+                ? max_added_ticks - m->active_clock_idle_credit_ticks : 0u;
+            uint64_t withheld = added_ticks - retirement_cap;
+            m->active_clock_idle_credit_ticks += withheld < room ? withheld : room;
+        }
+        added_ticks = retirement_cap;
+        clamp = true;
+    }
+    if (clamp)
+        active_clock_counter_add(&m->active_clock_clamps, 1u);
+    m->active_clock_fraction = due_fraction;
+
+    active_clock_counter_add(&m->active_clock_updates, 1u);
+    active_clock_counter_add(&m->active_clock_added_ticks, added_ticks);
+
+    /* added_ticks is bounded by 8 ms at a uint32_t CPU rate, hence it fits the
+     * public tick width. A zero call is still required to refresh MMIO levels
+     * and newly arrived host inputs at this synchronization boundary. */
+    s5l8900_tick(m, (uint32_t)added_ticks);
+    m->active_clock_guest_ticks_since_sync = 0u;
+    return true;
+}
+
+static void run_clock_retired(s5l8900_t *m, bool *active_clock,
+                              unsigned *pending_retired, unsigned retired,
+                              bool force_clock_sync,
+                              bool force_device_refresh) {
+    if (!*active_clock) {
+        s5l8900_tick(m, retired);
+        return;
+    }
+
+    *pending_retired += retired;
+    if (!force_clock_sync &&
+        *pending_retired < S5L8900_ACTIVE_CLOCK_SAMPLE_INSNS) {
+        /* Signed negative witnesses, MMIO and mode exits still require the
+         * post-retirement device boundary they historically received. A zero
+         * tick supplies that exact refresh without calling clock_gettime tens
+         * of millions of times per second. Retirements remain pending for the
+         * next periodic host-time sample. */
+        if (force_device_refresh) s5l8900_tick(m, 0u);
+        return;
+    }
+
+    unsigned fallback_ticks = *pending_retired;
+    *pending_retired = 0u;
+    if (!active_host_clock_sync(m, (uint32_t)fallback_ticks))
+        *active_clock = false;
+}
+
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+typedef struct {
+    s5l8900_t *machine;
+    bool *active_clock;
+    unsigned *pending_retired;
+} static_a64_retirement_boundary_t;
+
+/* A privileged compact prefix may remain inside the build-time-linked runner
+ * across a FETCH-window change only after receiving the same device/clock
+ * boundary its outer-loop return used to provide. The callback performs that
+ * exact accounting and then repeats the ordinary machine eligibility gate;
+ * the engine separately rechecks CPU/translation admission before reading the
+ * replacement window. */
+static bool static_a64_retirement_boundary(void *opaque, unsigned retired) {
+    static_a64_retirement_boundary_t *boundary =
+        (static_a64_retirement_boundary_t *)opaque;
+    if (!boundary || !boundary->machine || !boundary->active_clock ||
+        !boundary->pending_retired || !retired)
+        return false;
+    bool was_active = *boundary->active_clock;
+    s5l8900_t *m = boundary->machine;
+    /* A clean RAM-only prefix has not changed any interrupt level. In active
+     * clock mode there is no elapsed device time until the periodic sample.
+     * Reuse the event-region proof that SPI and DMA cannot progress: an empty
+     * receive channel may remain enabled, but any runnable/invalid descriptor,
+     * queued SPI word, MMIO, external input or live trace keeps the refresh.
+     * Public tick(0), run entry and actual clock samples remain unconditional.
+     * No cached device state or larger interrupt/input interval is introduced. */
+    bool refresh = !was_active || g_tick_eager || m->level_dirty ||
+        ext_inputs(m) != m->ext_seen || m->power_trace_ticks_left ||
+        m->pre_step_hook || !region_dma_inert(m);
+    run_clock_retired(boundary->machine, boundary->active_clock,
+                      boundary->pending_retired, retired, false, refresh);
+    /* A region admitted under wall time has no instruction-clock event
+     * horizon. Re-enter through the outer scheduler if the guard switches. */
+    if (was_active != *boundary->active_clock) return false;
+    return run_retirement_batch_limit(boundary->machine, 1u,
+                                      *boundary->active_clock) != 0u;
+}
+#endif
+
+unsigned s5l8900_static_a64_fallback_step(s5l8900_t *m,
+                                          arm_status_t *status) {
+    arm_status_t step_status;
+
+    if (!m || !status) return 0u;
+    *status = ARM_OK;
+    if (m->level_dirty || ext_inputs(m) != m->ext_seen ||
+        (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
+        (m->cpu.cpsr & ARM_CPSR_E) != 0u ||
+        m->cpu.abort_pending ||
+        (m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) ||
+        (m->cpu.irq_line && !(m->cpu.cpsr & ARM_CPSR_I)))
+        return 0u;
+    step_status = arm_step(&m->cpu);
+    *status = step_status;
+    if (step_status != ARM_OK) return 0u;
+
+    /* A fallback may perform MMIO or change instruction state/privilege. The
+     * resident ARM loop can continue only while the same User A32/Thumb machine
+     * boundary that admitted it remains exact. RETIRE_STOP still accounts the
+     * successful instruction before returning to the device tick. */
+    if (m->level_dirty || ext_inputs(m) != m->ext_seen ||
+        (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
+        (m->cpu.cpsr & ARM_CPSR_E) != 0u ||
+        m->cpu.abort_pending ||
+        (m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) ||
+        (m->cpu.irq_line && !(m->cpu.cpsr & ARM_CPSR_I)))
+        return 2u;
+    return 1u;
+}
+
+static bool powered_down_self_branch(const s5l8900_t *m) {
+    const arm_cpu_t *cpu = &m->cpu;
+    uint32_t pc = cpu->r[15];
+    uint32_t mode = cpu->cpsr & ARM_CPSR_MODE_MASK;
+    if (!m->wfi_host_sleep ||
+        (!s5l_pcf50635_in_hibernation(&m->pmu) &&
+         !s5l_pcf50635_in_standby(&m->pmu)) ||
+        (mode != ARM_MODE_SVC && mode != ARM_MODE_SYS) ||
+        (cpu->cpsr & (ARM_CPSR_T | ARM_CPSR_E | ARM_CPSR_I | ARM_CPSR_F)) !=
+            (ARM_CPSR_I | ARM_CPSR_F) ||
+        (cpu->cp15.sctlr & (1u << 7)) || cpu->abort_pending || (pc & 3u) ||
+        m->i2c[0].active || m->i2c[1].active ||
+        pre_step_target_matches(m, pc) ||
+        cpu->bus != &m->bus || m->bus.ctx != m ||
+        m->bus.host_ram != machine_host_ram || m->bus.read32 != r32 ||
+        m->bus.read16 != r16 || m->bus.read8 != r8 ||
+        !cpu->fetch_host || !cpu->fetch_priv ||
+        cpu->fetch_blk != (pc & ~1023u) || cpu->fetch_gen != cpu->tlb_gen ||
+        cpu->tlb_stamp.sctlr != cpu->cp15.sctlr ||
+        cpu->tlb_stamp.ttbr0 != cpu->cp15.ttbr0 ||
+        cpu->tlb_stamp.ttbr1 != cpu->cp15.ttbr1 ||
+        cpu->tlb_stamp.ttbcr != cpu->cp15.ttbcr ||
+        cpu->tlb_stamp.dacr != cpu->cp15.dacr ||
+        cpu->tlb_stamp.context_id != cpu->cp15.context_id)
+        return false;
+
+    /* OOCSHDWN alone is too early: XNU still saves its timebase and flushes
+     * caches before _ml_arm_sleep's final branch. Read only an already-proven
+     * plain-RAM fetch window, without a page walk, MMIO, or a firmware address
+     * special case. Re-read the bytes on every slice; this is not a code cache. */
+    const uint8_t *p = cpu->fetch_host + (pc & 1023u);
+    return p[0] == 0xfeu && p[1] == 0xffu &&
+           p[2] == 0xffu && p[3] == 0xeau; /* B . */
+}
+
+bool s5l8900_hibernation_ready(const s5l8900_t *m) {
+    return m && s5l_pcf50635_in_hibernation(&m->pmu) &&
+           !s5l_pcf50635_in_standby(&m->pmu) && powered_down_self_branch(m);
+}
+
+static bool powered_down_host_wait(s5l8900_t *m) {
+    if (!powered_down_self_branch(m)) {
+        m->power_wait_fraction = 0u;
+        return false;
+    }
+    active_clock_quiesce_input_guard(m);
+    active_clock_reset_anchor(m);
+    uint64_t start_ns = 0u, end_ns = 0u;
+    bool measured = m->active_host_now &&
+        m->active_host_now(m->active_host_now_ctx, &start_ns);
+    if (!m->wfi_host_sleep(m->wfi_host_sleep_ctx, S5L8900_WFI_PACE_SLICE_NS))
+        return true; /* No successful wait, no invented time or CPU work. */
+
+    uint64_t elapsed_ns = S5L8900_WFI_PACE_SLICE_NS;
+    if (measured && m->active_host_now(m->active_host_now_ctx, &end_ns) &&
+        end_ns >= start_ns && end_ns - start_ns > elapsed_ns) {
+        uint64_t maximum = S5L8900_WFI_PACE_SLICE_NS +
+                           S5L8900_ACTIVE_CLOCK_MAX_STEP_NS;
+        elapsed_ns = end_ns - start_ns;
+        if (elapsed_ns > maximum) elapsed_ns = maximum;
+    }
+    /* Only the always-on PMU clock runs here, not PWM, DMA, scanout or ARM.
+     * Measured scheduler oversleep is bounded; an explicit frontend pause
+     * never contributes. The 16 ms ceiling keeps ticks within uint32_t even
+     * at the largest supported PMU rate. */
+    uint64_t ticks = 0u, fraction = 0u;
+    if (active_clock_elapsed_ticks(elapsed_ns, m->pmu.tick_hz,
+                                   m->power_wait_fraction, &ticks, &fraction)) {
+        s5l_pcf50635_tick(&m->pmu, (uint32_t)ticks);
+        m->power_wait_fraction = fraction;
+    }
+    return true;
+}
+
+unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
+    arm_status_t st = ARM_OK;
+    unsigned n = 0;
+    unsigned active_pending_retired = 0u;
+    unsigned handled_steps = 0u;
+    bool active_clock = false;
+    if (max_steps && !m->restart_requested && powered_down_host_wait(m))
+        max_steps = 0u;
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+    static_a64_retirement_boundary_t static_boundary = {
+        .machine = m,
+        .active_clock = &active_clock,
+        .pending_retired = &active_pending_retired,
+    };
+    bool compact_pc_profile_slice =
+        s5l8900_static_a64_compact_raw_pc_profile_slice_begin(m);
+#endif
+    /* A direct arm_step() may have used the same machine between run calls.
+     * Only a wait reached during THIS bounded slice may shorten it. */
+    m->wfi_pace_yield = false;
+    if (max_steps && m->active_host_now &&
+        !m->active_clock_deadline_shield) {
+        if (!m->active_clock_anchor_valid) {
+            active_clock = active_host_clock_sync(m, 0u);
+        } else {
+            /* Do not consume elapsed host time at a run boundary that has no
+             * retired work to bound it.  The first periodic or forced sync in
+             * this slice will pair that interval with the instructions that
+             * were actually completed.  A zero refresh still exposes input
+             * and device levels before the first retirement. */
+            active_clock = true;
+            s5l8900_tick(m, 0u);
+        }
+    }
+    while (n < max_steps) {
+        if (m->restart_requested) {
+            st = ARM_RESTART;
+            break;
+        }
+        if (pre_step_target_matches(m, m->cpu.r[15])) {
+            /* Replacements need a separate budget: they do not retire CPU
+             * instructions. A helper returning to a hooked PC must still
+             * yield to the owner's stop/input checks. */
+            if (handled_steps == max_steps) break;
+            m->pre_step_matches++;
+            if (m->pre_step_hook(m->pre_step_ctx)) {
+                handled_steps++;
+                m->pre_step_handled++;
+                /* A replacement completes a whole guest operation but does
+                 * not pretend those skipped instructions retired.  One device
+                 * tick matches bootkernel's established HLE timing contract. */
+                run_clock_retired(m, &active_clock,
+                                  &active_pending_retired, 1u,
+                                  false,
+                                  m->level_dirty ||
+                                  ext_inputs(m) != m->ext_seen);
+                continue;
+            }
+        }
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+        /* The iOS product keeps the rejected signed engine compiled for exact
+         * experiments but leaves it disabled. Check that policy before the
+         * expensive timebase/input eligibility gate: the old order paid a
+         * 64-bit divide and several scattered loads on every interpreted guest
+         * instruction even though no signed state had ever been allocated. */
+        if (s5l8900_static_a64_is_enabled(m)) {
+            bool known_negative = false;
+            arm_status_t engine_status = ARM_OK;
+            unsigned boundary_retired = 0u;
+            unsigned batch = run_retirement_batch_limit(
+                m, max_steps - n, active_clock);
+            if (batch)
+                batch = s5l8900_static_a64_try(
+                    m, batch, &known_negative, &engine_status,
+                    static_a64_retirement_boundary, &static_boundary,
+                    &boundary_retired);
+            if (batch) {
+                if (boundary_retired > batch) {
+                    st = ARM_UNDEFINED;
+                    break;
+                }
+                n += batch;
+                unsigned unaccounted = batch - boundary_retired;
+                if (unaccounted || engine_status != ARM_OK) {
+                    run_clock_retired(
+                        m, &active_clock, &active_pending_retired,
+                        unaccounted, engine_status != ARM_OK,
+                        m->level_dirty ||
+                        ext_inputs(m) != m->ext_seen ||
+                        (known_negative && unaccounted != 0u));
+                }
+                if (engine_status != ARM_OK) {
+                    st = engine_status;
+                    break;
+                }
+                /* The ordinary next iteration would first repeat the machine
+                 * gate and only then discover the same negative cache entry.
+                 * Do those checks now and fall directly into its one
+                 * interpreter step. A timer/IRQ/input edge or changed byte
+                 * cancels the bypass. */
+                if (!known_negative || n >= max_steps)
+                    continue;
+                if (run_retirement_batch_limit(
+                        m, max_steps - n, active_clock) &&
+                    !s5l8900_static_a64_commit_known_negative_bypass(m))
+                    continue;
+            }
+            if (engine_status != ARM_OK) {
+                st = engine_status;
+                break;
+            }
+        }
+#endif
+
+        /* A limit of one cannot save a tick call, so retain the smaller
+         * ordinary path at the edge itself. Inside a real batch, inspect every
+         * retirement boundary for the exact three events the public tick would
+         * have observed: guest MMIO, a host-driven input, or departure from
+         * User mode. The final lump contains only successfully retired
+         * instructions; a non-OK arm_step() receives no device tick, matching
+         * the literal loop exactly. */
+        unsigned limit = interpreter_tick_batch_limit(
+            m, max_steps - n, active_clock);
+        if (limit > 1u) {
+            unsigned retired = 0u;
+            do {
+                st = arm_step(&m->cpu);
+                if (st != ARM_OK) break;
+                retired++;
+                if (m->level_dirty || ext_inputs(m) != m->ext_seen ||
+                    (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR)
+                    break;
+            } while (retired < limit);
+
+            if (retired) {
+                n += retired;
+                m->interpreter_tick_batches++;
+                m->interpreter_tick_batched_retired += retired;
+                run_clock_retired(m, &active_clock,
+                                  &active_pending_retired, retired,
+                                  st != ARM_OK,
+                                  m->level_dirty ||
+                                  ext_inputs(m) != m->ext_seen ||
+                                  (m->cpu.cpsr & ARM_CPSR_MODE_MASK) !=
+                                      ARM_MODE_USR);
+            }
+            if (st != ARM_OK) break;
+            continue;
+        }
+
+        st = arm_step(&m->cpu);
+        if (st != ARM_OK) break;
+        n++;
+        run_clock_retired(m, &active_clock, &active_pending_retired, 1u,
+                          m->wfi_pace_yield,
+                          m->level_dirty ||
+                          ext_inputs(m) != m->ext_seen);
+        if (m->wfi_pace_yield) {
+            m->wfi_pace_yield = false;
+            break;
+        }
+    }
+    /* The reset store may be the final retirement allowed by this slice. Do
+     * not require a second public run call merely to observe an edge already
+     * reached at this boundary. */
+    if (st == ARM_OK && m->restart_requested)
+        st = ARM_RESTART;
+    if (active_clock && active_pending_retired)
+        (void)active_host_clock_sync(
+            m, (uint32_t)active_pending_retired);
+#if defined(S5LBOX_STATIC_A64_ENGINE)
+    if (compact_pc_profile_slice)
+        s5l8900_static_a64_compact_raw_pc_profile_slice_end(m);
+#endif
+    if (m->uart4_host_service)
+        m->uart4_host_service(m->uart4_host_ctx, n);
+    if (st == ARM_RESTART) {
+        /* Copy both before clearing the edge: a successful callback may free
+         * and rebuild the machine, and this function deliberately dereferences
+         * no machine field after invoking it. */
+        s5l_restart_host_service_fn service = m->restart_host_service;
+        void *ctx = m->restart_host_ctx;
+        m->restart_requested = false;
+        if (service) st = service(ctx) ? ARM_OK : ARM_HALT;
+    }
+    if (status) *status = st;
+    return n;
+}
+
+uint64_t s5l8900_interpreter_tick_batches(const s5l8900_t *m) {
+    return m ? m->interpreter_tick_batches : 0u;
+}
+
+uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m) {
+    return m ? m->interpreter_tick_batched_retired : 0u;
+}

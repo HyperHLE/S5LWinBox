@@ -1,0 +1,538 @@
+/*
+ * S5LBox — VMBootOptions. See the header for the three outcomes and why
+ * `effective` is a separate field from `requested`.
+ *
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+ */
+#include "VMBootOptions.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/*
+ * How each row of VMOptions.c reaches — or fails to reach — a bring-up.
+ *
+ * Keyed by NAME rather than by index. The option table is walked in order by
+ * the settings screen and reordering it is a legitimate change; a positional
+ * map would then silently point every row at the wrong fate, which is exactly
+ * the class of bug this whole file exists to make impossible.
+ */
+typedef enum {
+    /* request->no_lcd_panel_id and request->no_memory_node: the two opt-outs
+     * bring-up actually reads that this table also offers. */
+    MAP_NO_LCD_PANEL_ID = 0,
+    MAP_NO_MEMORY_NODE,
+    /* rootfs_work_create()'s ca_software_render, at image-creation time. */
+    MAP_PROVISION_CA_SOFTWARE_RENDER,
+    /* rootfs_work_create()'s activation entries, likewise at image time. */
+    MAP_PROVISION_ACTIVATE,
+    /* The stock pppd launchd job, written into a new work image. */
+    MAP_PROVISION_PPP,
+    /* The live host NAT, conditional on that recorded PPP job. */
+    MAP_RUNTIME_NAT,
+    /* A device-tree nub. Set means "leave it matched"; clear un-matches it
+     * through s5l_bringup_request_t::unmatch. */
+    MAP_UNMATCH,
+    /* Bring-up always does the thing; the switch is not consulted. */
+    MAP_FIXED_ON,
+    /* Nothing in the app does the thing; the switch is not consulted. */
+    MAP_FIXED_OFF
+} vm_boot_map_kind_t;
+
+static const struct {
+    const char *name;             /* VMOptions.c's spelling, exactly */
+    unsigned char kind;           /* vm_boot_map_kind_t              */
+    const char *note;             /* optional user-facing qualification */
+    const char *path;             /* MAP_UNMATCH only: the node to strike */
+} VM_BOOT_MAP[] = {
+    /*
+     * THE FIVE NUBS, and they are live again.
+     *
+     * This block used to read "bring-up has no un-match step -- grep it for
+     * unmatch and there is nothing to find", and that was true and it cost a
+     * boot. On an iPhone 17 the app left all five matched and the guest hung:
+     * first burning ~51 M instructions inside AppleMBX+0xb440, then reaching
+     * 11.5 G without launchd ever starting. Both are named in bootkernel's own
+     * switch help -- the PowerVR driver busy-polls a reset bit in a register
+     * block we do not model, and the sha1 hardware hook makes launchd's first
+     * text page fail its signature so the boot spins on cs_invalid_page. The
+     * desktop never saw either, because bootkernel un-matches both by default.
+     *
+     * s5l_bringup_request_t::unmatch now carries the same step in the portable
+     * core, so these are ordinary rows: set leaves the nub matched, clear
+     * strikes its `compatible`. The table's defaults already had all five
+     * clear, which is why this fix changes behaviour without changing anybody's
+     * settings.
+     */
+    /* Un-matched, the PowerVR driver never probes and QuartzCore uses its
+     * software path. The old reason for this default -- an unmodelled reset
+     * poll -- is historical: the current MBX model now completes the measured
+     * reset, ring, 2D and 3D families. It remains opt-in until a final cold
+     * boot and a measured product-level cadence close the graphics gate. */
+    { "mbx", MAP_UNMATCH, NULL, "arm-io/mbx" },
+    /* Matched, IOCryptoAcceleratorFamily installs a sha1_hardware_hook and
+     * every exactly-4096-byte digest -- the size cs_validate_page asks for --
+     * goes to a register file this VM does not model. launchd's first text
+     * page then fails its signature and the boot spins on cs_invalid_page,
+     * having printed nothing at all. */
+    { "sha1", MAP_UNMATCH, NULL, "arm-io/sha1" },
+    /* This machine has no modem for the driver to find. */
+    { "baseband", MAP_UNMATCH, NULL, "baseband" },
+    /* The baseband's bus. */
+    { "spi2", MAP_UNMATCH, NULL, "arm-io/spi2" },
+    { "usb-otg", MAP_UNMATCH, NULL, "arm-io/usb-otg" },
+    /*
+     * The digitizer, and the only nub here whose default is MATCHED -- the
+     * touch controller is the point of the exercise, not a hazard to hide.
+     * Cleared, it trades touch for a screen while the Z2 bootload is
+     * unfinished: on 2026-07-29 the download transfers all 54,156 octets and
+     * never reaches EXEC, and userspace stops before it composites anything.
+     */
+    { "multitouch", MAP_UNMATCH, NULL, "arm-io/spi1/multi-touch" },
+
+    /*
+     * /vram:reg is published whenever the framebuffer is, and bring-up carries
+     * no separate opt-out for it (bringup.c guards it on `want_fb` alone).
+     * This app never sets no_framebuffer, so the answer is always yes. Turning
+     * the row off is the A/B control for the read-only-framebuffer failure,
+     * and it is not available here.
+     */
+    { "vram", MAP_FIXED_ON,
+      "/vram:reg is always published: bring-up ties it to the framebuffer, "
+      "which this app never turns off.", NULL },
+
+    { "lcd-panel-id", MAP_NO_LCD_PANEL_ID, NULL, NULL },
+    { "memory-reg",   MAP_NO_MEMORY_NODE,  NULL, NULL },
+
+    /*
+     * The IORTC halfword is entry zero of ios3_kernel_patch.c's fixed table,
+     * applied by the same gate call that installs the memory-disk SVC sites.
+     * The gate is all-or-nothing -- refusing it would take the root filesystem
+     * with it -- so this row cannot be turned off without a second gate.
+     */
+    { "rtc-patch", MAP_FIXED_ON,
+      "The IORTC wait patch is always applied: it is one entry in the kernel "
+      "gate's fixed table, and the gate that installs the memory-disk sites "
+      "cannot apply part of it.", NULL },
+
+    { "ca-software-render", MAP_PROVISION_CA_SOFTWARE_RENDER,
+      "Written into this machine's work image when that image is prepared, "
+      "not at boot, so changing it does nothing to a machine that already has "
+      "one. A new machine gets an image built with it as set now.", NULL },
+
+    /*
+     * This row used to say "not implemented anywhere", and that was true of
+     * the app and never true of the project: tools/rootfs_work.c has carried
+     * rootfs_work_activation_entries() -- the Lockdown directory the stock
+     * image lacks, and the data_ark.plist inside it -- and bootkernel has
+     * provisioned them by default for as long as the desktop has booted. The
+     * app links the same library and simply was not asking.
+     *
+     * Offline provisioning of two catalog objects on this machine's own
+     * writable image. No Apple record is applied and none is verified; the
+     * canonical firmware is not touched.
+     */
+    { "activate", MAP_PROVISION_ACTIVATE,
+      "Written into this machine's work image when that image is prepared, "
+      "not at boot, so changing it does nothing to a machine that already has "
+      "one. A new machine gets an image built with it as set now.", NULL },
+    /*
+     * Both halves stay off in the SETTINGS map, but the reasons are no longer
+     * the same and neither is "not implemented anywhere" any more. A later
+     * reconciliation step may turn both on together from this machine's
+     * completed install record; a live switch can never do that by itself.
+     *
+     * The code-signing half IS implemented in shared bring-up and bootkernel:
+     * the boot args gain cs_enforcement_disable, amfi_get_out_of_my_way and
+     * amfi_allow_any_signature, and /chosen/debug-enabled is set. The app
+     * enables it only together with the committed filesystem payload, never
+     * from this developer switch alone.
+     *
+     * The normal Settings action now downloads an exact, pinned package set,
+     * builds a complete stopped-machine disk and publishes one durable marker.
+     * That marker, not either developer switch, turns both halves on together.
+     * The older arbitrary-tar path remains a desktop diagnostic and is not the
+     * product installation format.
+     */
+    { "jb-codesign", MAP_FIXED_OFF,
+      "A switch cannot relax guest code signing. A completed per-machine "
+      "install record enables the matching guest policy.", NULL },
+    { "jb-payload", MAP_FIXED_OFF,
+      "A switch cannot install guest files during boot. The normal Jailbreak "
+      "action builds a verified stopped-machine disk and records both halves "
+      "only after publication succeeds.", NULL },
+
+    { "ppp", MAP_PROVISION_PPP,
+      "Written into a fresh work image; changing it later cannot rewrite an "
+      "existing guest filesystem.", NULL },
+    { "nat", MAP_RUNTIME_NAT, NULL, NULL }
+};
+
+#define VM_BOOT_MAP_COUNT \
+    ((unsigned)(sizeof VM_BOOT_MAP / sizeof VM_BOOT_MAP[0]))
+
+/*
+ * The map entry for option row `index`. False means the option table has grown
+ * a row nobody has decided about; the caller must not invent a fate for it.
+ */
+static bool mapped(unsigned index, unsigned char *out_kind,
+                   const char **out_note, const char **out_path) {
+    const vm_option_t *option = vm_option_at(index);
+    if (!option || !option->name) return false;
+    for (unsigned i = 0; i < VM_BOOT_MAP_COUNT; i++) {
+        if (strcmp(option->name, VM_BOOT_MAP[i].name) != 0) continue;
+        if (out_kind) *out_kind = VM_BOOT_MAP[i].kind;
+        if (out_note) *out_note = VM_BOOT_MAP[i].note;
+        if (out_path) *out_path = VM_BOOT_MAP[i].path;
+        return true;
+    }
+    return false;
+}
+
+/* How many rows the map has, for the drift test: the map and the option table
+ * must be the same set, and only a test can say so. */
+unsigned vm_boot_options_map_count(void) { return VM_BOOT_MAP_COUNT; }
+
+const char *vm_boot_options_map_name(unsigned index) {
+    if (index >= VM_BOOT_MAP_COUNT) return NULL;
+    return VM_BOOT_MAP[index].name;
+}
+
+/* The value a row carries when the caller supplied none: the table's default,
+ * never false. */
+static bool requested_value(const bool *values, unsigned count,
+                            unsigned index) {
+    if (values && index < count) return values[index];
+    const vm_option_t *option = vm_option_at(index);
+    return option ? option->def : false;
+}
+
+/* snprintf-style append that keeps counting past the end, so a truncated
+ * summary is still a terminated prefix rather than a lie about the count. */
+static void append(char *out, size_t cap, size_t *used, const char *text) {
+    if (!out || !cap || !text) return;
+    if (*used + 1u >= cap) { *used += strlen(text); return; }
+    int written = snprintf(out + *used, cap - *used, "%s", text);
+    if (written < 0) return;
+    *used += (size_t)written;
+    if (*used >= cap) *used = cap - 1u;
+}
+
+static void recount_and_summarize(vm_boot_options_report_t *report) {
+    if (!report) return;
+    report->applied = 0u;
+    report->provisioned = 0u;
+    report->ignored = 0u;
+    report->overridden = 0u;
+    report->summary[0] = '\0';
+
+    unsigned rows = report->count;
+    if (rows > VM_BOOT_OPTION_MAX) rows = VM_BOOT_OPTION_MAX;
+    for (unsigned i = 0u; i < rows; i++) {
+        switch ((vm_boot_option_outcome_t)report->row[i].outcome) {
+            case VM_BOOT_OPTION_APPLIED: report->applied++; break;
+            case VM_BOOT_OPTION_PROVISIONED: report->provisioned++; break;
+            case VM_BOOT_OPTION_IGNORED: report->ignored++; break;
+        }
+        if (report->row[i].effective != report->row[i].requested)
+            report->overridden++;
+    }
+
+    /* Two clauses, both optional, because they are different problems: a
+     * switch this start contradicts, and a switch fixed inside the image. */
+    size_t used = 0u;
+    if (report->overridden > 0u) {
+        char head[96];
+        (void)snprintf(head, sizeof head,
+                       "%u switch%s not applied as set: ",
+                       report->overridden,
+                       report->overridden == 1u ? " is" : "es are");
+        append(report->summary, sizeof report->summary, &used, head);
+        unsigned printed = 0u;
+        for (unsigned i = 0u; i < rows; i++) {
+            if (report->row[i].effective == report->row[i].requested) continue;
+            const vm_option_t *option = vm_option_at(i);
+            if (printed++) append(report->summary, sizeof report->summary,
+                                  &used, ", ");
+            append(report->summary, sizeof report->summary, &used,
+                   option && option->name ? option->name : "?");
+        }
+        append(report->summary, sizeof report->summary, &used, ".");
+    }
+    if (report->provisioned > 0u) {
+        if (used > 0u)
+            append(report->summary, sizeof report->summary, &used, " ");
+        append(report->summary, sizeof report->summary, &used,
+               "Fixed when the work image was made: ");
+        unsigned printed = 0u;
+        for (unsigned i = 0u; i < rows; i++) {
+            if (report->row[i].outcome != VM_BOOT_OPTION_PROVISIONED) continue;
+            const vm_option_t *option = vm_option_at(i);
+            if (printed++) append(report->summary, sizeof report->summary,
+                                  &used, ", ");
+            append(report->summary, sizeof report->summary, &used,
+                   option && option->name ? option->name : "?");
+        }
+        append(report->summary, sizeof report->summary, &used, ".");
+    }
+    report->summary[sizeof report->summary - 1u] = '\0';
+}
+
+void vm_boot_options_apply(const bool *values, unsigned count,
+                           s5l_bringup_request_t *request,
+                           vm_boot_options_report_t *report) {
+    if (!report) return;
+    memset(report, 0, sizeof *report);
+
+    unsigned rows = vm_option_count();
+    if (rows > VM_BOOT_OPTION_MAX) rows = VM_BOOT_OPTION_MAX;
+    report->count = rows;
+
+    for (unsigned i = 0; i < rows; i++) {
+        vm_boot_option_status_t *row = &report->row[i];
+        unsigned char kind = MAP_FIXED_OFF;
+        const char *note = NULL;
+        const char *path = NULL;
+
+        row->requested = requested_value(values, count, i);
+
+        if (!mapped(i, &kind, &note, &path)) {
+            /*
+             * A row nobody has decided about. Reported as ignored with an
+             * explicit note rather than quietly given a plausible fate: the
+             * test below fails on this, and until somebody fixes the map the
+             * user is told the truth, which is that the app does not know.
+             */
+            row->outcome = VM_BOOT_OPTION_IGNORED;
+            row->effective = false;
+            row->note = "This switch has no recorded effect on the app's "
+                        "bring-up. Nothing reads it.";
+            report->ignored++;
+            if (row->effective != row->requested) report->overridden++;
+            continue;
+        }
+
+        row->note = note;
+        switch (kind) {
+            case MAP_NO_LCD_PANEL_ID:
+                row->outcome = VM_BOOT_OPTION_APPLIED;
+                row->effective = row->requested;
+                if (request) request->no_lcd_panel_id = !row->requested;
+                report->applied++;
+                break;
+            case MAP_NO_MEMORY_NODE:
+                row->outcome = VM_BOOT_OPTION_APPLIED;
+                row->effective = row->requested;
+                if (request) request->no_memory_node = !row->requested;
+                report->applied++;
+                break;
+            case MAP_UNMATCH:
+                /*
+                 * Set means "leave it matched", so the un-match list is built
+                 * from the CLEARED rows. The row is APPLIED either way: doing
+                 * nothing because the user asked for the nub to stay is the
+                 * switch working, not the switch being ignored.
+                 */
+                row->outcome = VM_BOOT_OPTION_APPLIED;
+                row->effective = row->requested;
+                if (!row->requested && path && *path &&
+                    report->unmatch_count < VM_BOOT_OPTION_MAX) {
+                    report->unmatch[report->unmatch_count++] = path;
+                }
+                report->applied++;
+                break;
+            case MAP_PROVISION_ACTIVATE:
+            case MAP_PROVISION_CA_SOFTWARE_RENDER:
+            case MAP_PROVISION_PPP:
+                row->outcome = VM_BOOT_OPTION_PROVISIONED;
+                row->effective = row->requested;
+                report->provisioned++;
+                break;
+            case MAP_RUNTIME_NAT: {
+                int ppp = vm_option_index("ppp");
+                bool link = ppp >= 0 &&
+                    requested_value(values, count, (unsigned)ppp);
+                row->outcome = VM_BOOT_OPTION_APPLIED;
+                row->effective = row->requested && link;
+                row->note = link ? NULL :
+                    "Requires PPP in this machine's work image.";
+                report->applied++;
+                break;
+            }
+            case MAP_FIXED_ON:
+                row->outcome = VM_BOOT_OPTION_IGNORED;
+                row->effective = true;
+                report->ignored++;
+                break;
+            case MAP_FIXED_OFF:
+            default:
+                row->outcome = VM_BOOT_OPTION_IGNORED;
+                row->effective = false;
+                report->ignored++;
+                break;
+        }
+        if (row->effective != row->requested) report->overridden++;
+    }
+
+    /*
+     * Hand the list to bring-up. It points into `report`, which the caller
+     * holds across s5l_bringup() -- VMFirmwareBoot.c declares both in the same
+     * frame. NULL when empty rather than a valid pointer with a zero count, so
+     * a caller that reads one field and not the other cannot walk it.
+     */
+    if (request) {
+        request->unmatch = report->unmatch_count ? report->unmatch : NULL;
+        request->unmatch_count = report->unmatch_count;
+    }
+
+    recount_and_summarize(report);
+}
+
+unsigned vm_boot_options_startup_warning(const vm_boot_options_report_t *report,
+                                          char *out, size_t capacity) {
+    if (out && capacity) out[0] = '\0';
+    if (!report) return 0u;
+    unsigned rows = report->count;
+    if (rows > VM_BOOT_OPTION_MAX) rows = VM_BOOT_OPTION_MAX;
+    const int codesign = vm_option_index("jb-codesign");
+    const int payload = vm_option_index("jb-payload");
+    const bool installed = codesign >= 0 && payload >= 0 &&
+        (unsigned)codesign < rows && (unsigned)payload < rows &&
+        report->row[codesign].outcome == VM_BOOT_OPTION_APPLIED &&
+        report->row[payload].outcome == VM_BOOT_OPTION_PROVISIONED &&
+        report->row[codesign].effective && report->row[payload].effective;
+    unsigned warnings = 0u;
+    size_t used = 0u;
+    for (unsigned i = 0u; i < rows; i++) {
+        const vm_boot_option_status_t *row = &report->row[i];
+        if (row->effective == row->requested) continue;
+        if (installed && ((int)i == codesign || (int)i == payload)) continue;
+        append(out, capacity, &used, warnings++ ? ", " :
+               "Settings not applied as requested: ");
+        const vm_option_t *option = vm_option_at(i);
+        append(out, capacity, &used, option ? option->name : "?");
+    }
+    if (warnings) append(out, capacity, &used, ". Review Advanced settings.");
+    return warnings;
+}
+
+void vm_boot_options_for_provisioning(const bool *values, unsigned count,
+                                      vm_boot_provision_options_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+
+    int index = vm_option_index("ca-software-render");
+    if (index >= 0)
+        out->ca_software_render = requested_value(values, count, (unsigned)index);
+
+    index = vm_option_index("activate");
+    if (index >= 0)
+        out->activate = requested_value(values, count, (unsigned)index);
+
+    index = vm_option_index("ppp");
+    if (index >= 0)
+        out->ppp = requested_value(values, count, (unsigned)index);
+}
+
+void vm_boot_options_reconcile_network(vm_boot_options_report_t *report,
+                                       s5l_bringup_request_t *request,
+                                       bool ppp_provisioned) {
+    /*
+     * This is runtime policy derived from the WORK IMAGE, not from today's
+     * PPP switch. The launchd job can outlive a later settings change.
+     *
+     * This diagnostic branch deliberately re-enters the stock UART4 DMA path
+     * after the physically verified PIO fallback isolated its receive overflow.
+     * It is explicit in the console and paired with live PL080 endpoint
+     * witnesses; it is not an acceptance claim. The stable branch continues to
+     * force PIO until this branch completes LCP/IPCP on a physical phone.
+     *
+     * Preserve an unrelated caller-owned command line. The ordinary app
+     * supplies NULL here; the explicit equality branch documents the only
+     * other input this helper owns.
+     */
+    if (request && ppp_provisioned &&
+        (!request->cmdline ||
+         strcmp(request->cmdline, S5L_BRINGUP_DEFAULT_CMDLINE) == 0)) {
+        request->cmdline = S5L_BRINGUP_DEFAULT_CMDLINE
+                           " uart4_dma_enable=1";
+    }
+    if (!report) return;
+    int ppp = vm_option_index("ppp");
+    int nat = vm_option_index("nat");
+    if (ppp >= 0 && (unsigned)ppp < report->count) {
+        vm_boot_option_status_t *row = &report->row[ppp];
+        row->outcome = VM_BOOT_OPTION_PROVISIONED;
+        row->effective = ppp_provisioned;
+        if (row->requested == ppp_provisioned) {
+            row->note = "Recorded in this work image when it was made.";
+        } else if (ppp_provisioned) {
+            row->note = "This work image contains the PPP job; remaking the "
+                        "image is required to remove it.";
+        } else {
+            row->note = "This work image was made without PPP; remaking the "
+                        "image is required to add it.";
+        }
+    }
+    if (nat >= 0 && (unsigned)nat < report->count) {
+        vm_boot_option_status_t *row = &report->row[nat];
+        row->outcome = VM_BOOT_OPTION_APPLIED;
+        row->effective = row->requested && ppp_provisioned;
+        row->note = ppp_provisioned ? NULL :
+            "No host route is attached because this work image has no PPP job.";
+    }
+    recount_and_summarize(report);
+}
+
+void vm_boot_options_reconcile_jailbreak(vm_boot_options_report_t *report,
+                                         s5l_bringup_request_t *request,
+                                         bool installed) {
+    /*
+     * The marker is authoritative because it is published only after the
+     * replacement work image is complete. A switch is not authority to relax
+     * the running kernel: doing that against an unmodified filesystem would
+     * expose a misleading half-jailbreak, while leaving policy off against an
+     * installed filesystem would make its executables fail unpredictably.
+     */
+    if (request) request->guest_codesign_disabled = installed;
+    if (!report) return;
+
+    int codesign = vm_option_index("jb-codesign");
+    int payload = vm_option_index("jb-payload");
+    if (codesign >= 0 && (unsigned)codesign < report->count) {
+        vm_boot_option_status_t *row = &report->row[codesign];
+        row->outcome = VM_BOOT_OPTION_APPLIED;
+        row->effective = installed;
+        if (row->requested == installed) {
+            row->note = installed ?
+                "Enabled by this machine's completed install record." :
+                "Disabled because this machine has no completed install "
+                "record.";
+        } else if (installed) {
+            row->note = "This machine records an installed payload, so its "
+                        "matching guest code-signing policy is required.";
+        } else {
+            row->note = "A setting cannot relax guest code signing without "
+                        "a completed filesystem transaction.";
+        }
+    }
+    if (payload >= 0 && (unsigned)payload < report->count) {
+        vm_boot_option_status_t *row = &report->row[payload];
+        row->outcome = VM_BOOT_OPTION_PROVISIONED;
+        row->effective = installed;
+        if (row->requested == installed) {
+            row->note = installed ?
+                "Recorded after this machine's filesystem transaction "
+                "completed." :
+                "No completed payload transaction is recorded for this "
+                "machine.";
+        } else if (installed) {
+            row->note = "This machine's work image already contains the "
+                        "installed payload.";
+        } else {
+            row->note = "A setting cannot install a payload during boot; no "
+                        "completed filesystem transaction is recorded.";
+        }
+    }
+    recount_and_summarize(report);
+}

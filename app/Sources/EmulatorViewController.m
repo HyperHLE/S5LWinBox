@@ -1,0 +1,1997 @@
+//
+//  S5LBox — root view controller.
+//
+//  The screen is now the point. The top of the view is the guest's 320x480
+//  framebuffer; underneath it is the guest's UART, which is where an operating
+//  system announces itself. Between them is a status line showing that the
+//  emulator is doing work rather than being a picture of an emulator.
+//
+//  The self-tests that used to be this whole screen still run, once, at launch,
+//  and print into the console: they are the proof that the ARM core, the MMU,
+//  the bus, the UART, the VIC and the timer all work on *this* device, and that
+//  is worth keeping even now that there is something to look at.
+//
+//  WHAT THE CONTROLS ON THIS SCREEN DO, AND DO NOT DO
+//
+//  Play/pause and reset drive the emulator and are read back from it, so the
+//  toolbar shows what the machine is doing rather than what the last tap
+//  intended. Everything to do with INPUT does not work, and is drawn as not
+//  working: the row of physical keys under the screen is disabled with the
+//  reason printed beneath it, and a finger on the guest's panel has its
+//  coordinate mapped, shown on the status line, and thrown away.
+//
+//  That last part is deliberate rather than lazy. The mapping is real, tested
+//  arithmetic (VMTouchMap.c, app/Tests/test_vmtouchmap.c), and showing it live
+//  is how it can be seen to be right before there is a digitizer to send it to.
+//  What must never happen is a control that looks like it works.
+//
+//  Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+//
+#import "EmulatorViewController.h"
+#import "VMButtonBar.h"
+#import "VMHardwareButton.h"
+#import "VMDeviceControlsViewController.h"
+#import "VMEngine.h"
+#import "VMConsoleViewController.h"
+#import "VMFramebufferView.h"
+#import "VMGuest.h"
+#import "VMSettings.h"
+#import "VMRuntimeSettingsViewController.h"
+#import "VMPackageManagerViewController.h"
+#import "VMSnapshotListViewController.h"
+#import "VMInstanceStore.h"
+#include "VMSnapshotStore.h"
+#import "VMTouchMap.h"
+
+#import <QuartzCore/QuartzCore.h>
+#import <math.h>
+#import <stdlib.h>
+#import <string.h>
+#import <sys/mman.h>
+#import <sys/utsname.h>
+#import <unistd.h>
+
+// csops() reports our own code-signing flags. A jailbreak that enables "JIT in
+// apps" sets CS_DEBUGGED, which is what permits unsigned executable memory.
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define CS_OPS_STATUS 0
+#define CS_DEBUGGED   0x10000000
+
+// Scrollback kept in the console. The guest prints one short line per frame
+// forever, so this cannot be unbounded.
+static const NSUInteger kConsoleScrollback = 12000;
+
+/*
+ * iOS 26 added UINavigationController's content-wide interactive pop gesture
+ * alongside the older leading-edge gesture.  Keep the lookup dynamic so this
+ * iOS 13-deployment app still compiles with an older SDK and runs on an older
+ * UIKit; respondsToSelector: is the runtime availability gate.
+ */
+static UIGestureRecognizer *VMContentPopGestureRecognizer(
+        UINavigationController *navigationController) {
+    SEL selector = NSSelectorFromString(@"interactiveContentPopGestureRecognizer");
+    if (!navigationController ||
+        ![navigationController respondsToSelector:selector]) return nil;
+    return [navigationController valueForKey:NSStringFromSelector(selector)];
+}
+
+@class EmulatorViewController;
+
+// UINavigationBar owns this view's frame, including during push/pop animations.
+// Advertise a preferred size and let the bar shrink it around its buttons.
+@interface VMMachineHeadingView : UIView
+@end
+@implementation VMMachineHeadingView
+- (CGSize)intrinsicContentSize { return CGSizeMake(220, 40); }
+- (CGSize)sizeThatFits:(CGSize)size {
+    CGSize preferred = self.intrinsicContentSize;
+    if (size.width > 0) preferred.width = MIN(preferred.width, size.width);
+    if (size.height > 0) preferred.height = MIN(preferred.height, size.height);
+    return preferred;
+}
+@end
+
+/* CADisplayLink retains its target. Keeping only a weak edge back to the view
+ * controller lets normal controller teardown reach -dealloc and stop the VM. */
+@interface VMDisplayLinkProxy : NSObject
+- (instancetype)initWithTarget:(EmulatorViewController *)target;
+- (void)tick:(CADisplayLink *)sender;
+@end
+
+// Declared up front so every call below is checked against a prototype.
+@interface EmulatorViewController () <VMButtonBarDelegate,
+                                      VMFramebufferViewTouchDelegate,
+                                      VMSnapshotListDelegate,
+                                      VMDeviceControlsDelegate,
+                                      UIGestureRecognizerDelegate>
+- (NSString *)snapshotsDirectory;
+- (void)startEmulator;
+- (void)launchEngine;
+- (void)reportBringUpProblem:(NSString *)reason;
+- (void)tick:(CADisplayLink *)sender;
+- (void)append:(NSString *)line;
+- (void)appendConsole:(NSString *)text;
+- (void)flushConsole;
+- (void)reportEnvironment;
+- (void)runUartDemo;
+- (void)runInterruptDemo;
+- (void)runMmuDemo;
+- (void)appDidEnterBackground:(NSNotification *)notification;
+- (void)appWillEnterForeground:(NSNotification *)notification;
+- (void)appDidBecomeActive:(NSNotification *)notification;
+- (void)settingsDidChange:(NSNotification *)notification;
+- (BOOL)toggleHostControls;
+- (void)blockSystemPopGestures;
+- (void)restoreSystemPopGestures;
+- (void)beginCheckpointBackgroundTask;
+- (void)endCheckpointBackgroundTask;
+- (void)setCheckpointSaving:(BOOL)saving;
+- (void)setRestarting:(BOOL)restarting;
+- (void)applyPauseState;
+- (void)applySettingsToEngine;
+- (void)refreshRunControls;
+- (void)refreshStatusLine;
+- (void)playPauseTapped:(id)sender;
+- (void)resetTapped:(id)sender;
+- (void)settingsTapped:(id)sender;
+- (void)consoleTapped:(id)sender;
+- (void)backTapped:(id)sender;
+- (void)saveAndCloseTapped:(id)sender;
+- (void)shutDownTapped:(id)sender;
+- (void)shutDownGuestAndRestart:(BOOL)restart;
+- (void)forcePowerOffTapped:(id)sender;
+- (void)forcePowerOff;
+- (void)buildModernControls;
+- (void)applyInterfaceStyle;
+- (void)refreshModernControls;
+- (void)updateMachineHeadingFonts;
+- (void)layoutModernInterface;
+- (void)deviceControlsTapped:(id)sender;
+@end
+
+@implementation VMDisplayLinkProxy {
+    __weak EmulatorViewController *_target;
+}
+
+- (instancetype)initWithTarget:(EmulatorViewController *)target {
+    self = [super init];
+    if (self) _target = target;
+    return self;
+}
+
+- (void)tick:(CADisplayLink *)sender {
+    EmulatorViewController *target = _target;
+    if (target) [target tick:sender];
+    else [sender invalidate];
+}
+
+@end
+
+@implementation EmulatorViewController {
+    VMFramebufferView *_screen;
+    /*
+     * THE PREPARING OVERLAY. Shown over the guest screen while the one slow
+     * first-boot step runs, because "Preparing iPhone OS -- close and reopen it
+     * after finishing" told the user to wait without saying for how long, and
+     * offered no way to tell a working copy from a stuck one.
+     *
+     * A real bar, driven by the byte count rootfs_work.c reports as it copies
+     * the ~433 MB source. When the copy has not reported yet the bar is hidden
+     * and the label alone shows, rather than a bar pinned at zero -- which
+     * reads as broken rather than as starting.
+     */
+    UIView            *_prepareScrim;
+    UILabel           *_prepareLabel;
+    UIProgressView    *_prepareBar;
+    VMButtonBar       *_keys;
+    UILabel           *_stats;
+    UITextView        *_console;
+    UIToolbar         *_toolbar;
+    UIView            *_dock;
+    VMHardwareButton  *_homeButton;
+    UIButton          *_settingsButton, *_deviceControlsButton;
+    VMMachineHeadingView *_machineHeading;
+    UILabel           *_machineTitle, *_machineStatus;
+    BOOL               _legacyInterface;
+    NSMutableString   *_consoleText;
+    BOOL               _consoleDirty;
+
+    VMEngine          *_engine;
+    CADisplayLink     *_link;
+    uint8_t           *_frame;        // main thread's copy of the guest's pixels
+    NSUInteger         _ticks;
+
+    /* The last -bringUpNote this screen actually put in front of the user, so
+     * -tick: can notice a NEW one -- the root-filesystem provisioning thread
+     * finishes long after -start returned -- without re-alerting on the same
+     * sentence eight frames later. Reset to nil with the engine. */
+    NSString          *_lastBringUpNote;
+
+    /* Pause has two independent causes and the engine has one flag, so the
+     * causes are tracked here and combined. Without this, coming back to the
+     * foreground would silently un-pause a machine the user had paused on
+     * purpose. Neither of these is a copy of engine state: they are the two
+     * reasons for it, and -applyPauseState is the only thing that writes it. */
+    BOOL               _userPaused;
+    BOOL               _inBackground;
+    /* Copied once on open. Runtime Settings never rewrites app defaults. */
+    BOOL               _sessionPausesInBackground;
+    BOOL               _sessionInlineConsole;
+    uint64_t           _sessionInstructionCap;
+    BOOL               _savingCheckpoint;
+    BOOL               _restarting;
+    BOOL               _shuttingDown;
+    BOOL               _forcePowerOffRequested;
+    BOOL               _forcePoweringOff;
+    BOOL               _homeOnlyInterface;
+    BOOL               _controlsRevealed;
+    BOOL               _launchShutdownRequested;
+    BOOL               _packageSetupRequested;
+    BOOL               _restoreIdleTimer;
+    BOOL               _previousIdleTimerDisabled;
+    UIBackgroundTaskIdentifier _checkpointBackgroundTask;
+
+    /* What the toolbar is currently showing, so it is only rebuilt when the
+     * engine's answer changes rather than four times a second. */
+    BOOL               _toolbarShowsPlay;
+    BOOL               _toolbarBuilt;
+
+    /* The last touch the mapping produced. Displayed, never delivered. */
+    BOOL               _haveTouch;
+    int                _touchX;
+    int                _touchY;
+
+    /*
+     * A horizontal guest swipe must reach the emulated touchscreen, not pop
+     * this controller and tear down the machine.  Preserve each recognizer's
+     * prior state rather than blindly enabling it on exit: the navigation
+     * controller or another screen may already have disabled one.
+     */
+    __weak UIGestureRecognizer *_blockedEdgePopGesture;
+    __weak UIGestureRecognizer *_blockedContentPopGesture;
+    BOOL _edgePopGestureWasEnabled;
+    BOOL _contentPopGestureWasEnabled;
+}
+
+#pragma mark - Lifecycle
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self blockSystemPopGestures];
+    [self applyInterfaceStyle];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    /* UINavigationController may finish installing its iOS 26 recognizer as
+     * the push completes. Re-run the idempotent block after that transition. */
+    [self blockSystemPopGestures];
+    if (_homeOnlyInterface && !self.presentedViewController &&
+        ![NSUserDefaults.standardUserDefaults boolForKey:@"VMHomeOnlyHintSeen"]) {
+        [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"VMHomeOnlyHintSeen"];
+        UIAlertController *hint = [UIAlertController alertControllerWithTitle:@"Home only"
+            message:@"Tap outside the guest display to show or hide controls."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [hint addAction:[UIAlertAction actionWithTitle:@"Got it" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:hint animated:YES completion:nil];
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [_homeButton releasePress];
+    [self.navigationController setNavigationBarHidden:NO animated:NO];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    /* Do not restore during an interactive transition. If a system gesture
+     * somehow starts and is later cancelled, viewWillDisappear: still runs;
+     * restoring there would re-enable that gesture under its own transition. */
+    [self restoreSystemPopGestures];
+}
+
+- (void)blockSystemPopGestures {
+    UINavigationController *navigationController = self.navigationController;
+    UIGestureRecognizer *edge = navigationController.interactivePopGestureRecognizer;
+    UIGestureRecognizer *content =
+        VMContentPopGestureRecognizer(navigationController);
+
+    if (edge && !_blockedEdgePopGesture) {
+        _blockedEdgePopGesture = edge;
+        _edgePopGestureWasEnabled = edge.enabled;
+    }
+    if (content && content != edge && !_blockedContentPopGesture) {
+        _blockedContentPopGesture = content;
+        _contentPopGestureWasEnabled = content.enabled;
+    }
+
+    _blockedEdgePopGesture.enabled = NO;
+    _blockedContentPopGesture.enabled = NO;
+}
+
+- (void)restoreSystemPopGestures {
+    UIGestureRecognizer *edge = _blockedEdgePopGesture;
+    UIGestureRecognizer *content = _blockedContentPopGesture;
+    if (edge) edge.enabled = _edgePopGestureWasEnabled;
+    if (content) content.enabled = _contentPopGestureWasEnabled;
+    _blockedEdgePopGesture = nil;
+    _blockedContentPopGesture = nil;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    VMSettings *defaults = [VMSettings sharedSettings];
+    _sessionPausesInBackground = [defaults pausesInBackground];
+    _sessionInlineConsole = [defaults inlineConsole];
+    _sessionInstructionCap = [defaults instructionCap];
+    _checkpointBackgroundTask = UIBackgroundTaskInvalid;
+    self.view.backgroundColor = [UIColor blackColor];
+
+    /* Machines benefits from a large browsing title; the running guest does
+     * not. Keep its name in the compact navigation bar beside Back so the
+     * framebuffer gets the vertical space and the title stays centred. */
+    self.navigationItem.largeTitleDisplayMode =
+        UINavigationItemLargeTitleDisplayModeNever;
+
+    /* The stock navigation back item pops immediately, which used to destroy
+     * the only live machine state. This explicit item keeps the familiar
+     * chevron but routes the action through the asynchronous checkpoint. */
+    self.navigationItem.hidesBackButton = YES;
+    UIImage *backImage = [UIImage systemImageNamed:@"chevron.left"];
+    UIBarButtonItem *backItem = backImage
+        ? [[UIBarButtonItem alloc] initWithImage:backImage
+                                          style:UIBarButtonItemStylePlain
+                                         target:self
+                                         action:@selector(backTapped:)]
+        : [[UIBarButtonItem alloc] initWithTitle:@"Machines"
+                                          style:UIBarButtonItemStylePlain
+                                         target:self
+                                         action:@selector(backTapped:)];
+    backItem.accessibilityLabel = @"Back to Machines";
+    self.navigationItem.leftBarButtonItem = backItem;
+
+    _consoleText = [NSMutableString string];
+
+    _screen = [[VMFramebufferView alloc] initWithFrame:CGRectZero];
+    _screen.layer.borderWidth = 1.0;
+    _screen.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
+    /* Setting the delegate is what turns the picture into a touch surface. The
+     * coordinates it produces are shown on the status line and discarded; see
+     * -framebufferView:touchAtGuestX:guestY:phase:. */
+    _screen.touchDelegate = self;
+    [self.view addSubview:_screen];
+
+    /* Over the screen and nothing else: the toolbar stays live so a user can
+     * still leave, and the console stays readable. */
+    _prepareScrim = [[UIView alloc] initWithFrame:CGRectZero];
+    _prepareScrim.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.72];
+    _prepareScrim.hidden = YES;
+    [self.view addSubview:_prepareScrim];
+
+    _prepareLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _prepareLabel.backgroundColor = [UIColor clearColor];
+    _prepareLabel.textColor = [UIColor whiteColor];
+    _prepareLabel.textAlignment = NSTextAlignmentCenter;
+    _prepareLabel.numberOfLines = 3;
+    _prepareLabel.font = [UIFont systemFontOfSize:13];
+    _prepareLabel.text = @"Preparing iPhone OS…";
+    [_prepareScrim addSubview:_prepareLabel];
+
+    _prepareBar = [[UIProgressView alloc]
+                      initWithProgressViewStyle:UIProgressViewStyleDefault];
+    _prepareBar.progress = 0.0f;
+    [_prepareScrim addSubview:_prepareBar];
+
+    _keys = [[VMButtonBar alloc] initWithFrame:CGRectZero];
+    _keys.delegate = self;
+    /* The bar asks the engine whether input goes anywhere, rather than being
+     * told here that it does not. One nil from the engine lights it up. */
+    _keys.unavailableReason = [VMEngine buttonUnavailableReason];
+    [self.view addSubview:_keys];
+
+    _stats = [[UILabel alloc] initWithFrame:CGRectZero];
+    _stats.backgroundColor = [UIColor clearColor];
+    _stats.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+    _stats.font = [UIFont fontWithName:@"Menlo" size:10]
+                  ?: [UIFont systemFontOfSize:10];
+    _stats.numberOfLines = 3;
+    _stats.text = @"starting…";
+    [self.view addSubview:_stats];
+
+    _console = [[UITextView alloc] initWithFrame:CGRectZero];
+    _console.backgroundColor = [UIColor blackColor];
+    _console.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.5 alpha:1.0];
+    _console.font = [UIFont fontWithName:@"Menlo" size:10]
+                    ?: [UIFont systemFontOfSize:10];
+    _console.editable = NO;
+    /* Stated rather than inherited. A non-editable text view is selectable by
+     * default, but "you can select and copy the guest's output" is a property
+     * worth writing down, and -flushConsole depends on it being true. */
+    _console.selectable = YES;
+    _console.dataDetectorTypes = UIDataDetectorTypeNone;
+    _console.textContainerInset = UIEdgeInsetsMake(6, 12, 12, 12);
+    /*
+     * In the hierarchy but HIDDEN by default. The guest's serial output used
+     * to occupy 38% of this screen for everybody; it now has its own screen,
+     * and comes back underneath the picture only when "Console under the
+     * screen" is on -- a developer-mode setting whose one real use is watching
+     * output arrive WHILE the guest runs, which a separate screen cannot do.
+     */
+    _console.hidden = YES;
+    [self.view addSubview:_console];
+
+    /* A real UIToolbar rather than a row of buttons: the system draws the
+     * standard play/pause/refresh glyphs, and they are the ones anybody with an
+     * iPhone already knows. */
+    _toolbar = [[UIToolbar alloc] initWithFrame:CGRectZero];
+    _toolbar.barStyle = UIBarStyleBlack;
+    _toolbar.translucent = NO;
+    [self.view addSubview:_toolbar];
+    [self buildModernControls];
+    [self applyInterfaceStyle];
+    [self refreshRunControls];
+
+    [self append:@"S5LBox  ·  on-device self-test"];
+    [self append:@"================================\n"];
+    [self reportEnvironment];
+    [self append:@"\n-- emulated S5L8900 --"];
+    [self runUartDemo];
+    [self runInterruptDemo];
+    [self runMmuDemo];
+    [self append:@"\n-- guest framebuffer --"];
+
+    [self startEmulator];
+}
+
+/* Everything that happens once: the pixel buffer, the display link, and the
+ * notifications. -launchEngine is separate because Reset does it again. */
+- (void)startEmulator {
+    _frame = calloc(1, VM_FB_BYTES);
+    if (!_frame) { [self append:@"[vm] out of memory for the frame buffer"]; return; }
+
+    // Match the original panel's 60 Hz ceiling. VMEngine only marks changed
+    // pixels fresh, so an idle guest does not cause repeated image uploads.
+    VMDisplayLinkProxy *proxy = [[VMDisplayLinkProxy alloc] initWithTarget:self];
+    _link = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(tick:)];
+    _link.preferredFramesPerSecond = 60;
+    [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+    // Interpreting flat out in the background is a good way to be terminated,
+    // and nobody is looking at the screen anyway. Use actual background
+    // transitions, not WillResignActive: transient interruptions such as
+    // Control Center are not permission to leave the guest suspended.
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(appDidEnterBackground:)
+               name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [nc addObserver:self selector:@selector(appWillEnterForeground:)
+               name:UIApplicationWillEnterForegroundNotification object:nil];
+    [nc addObserver:self selector:@selector(appDidBecomeActive:)
+               name:UIApplicationDidBecomeActiveNotification object:nil];
+    [nc addObserver:self selector:@selector(settingsDidChange:)
+               name:VMSettingsDidChangeNotification object:nil];
+
+    [self launchEngine];
+
+    /* Reconcile with the current state, so a background notification that
+     * arrived before the observers above existed cannot leave the interpreter
+     * burning CPU in the background on a memory-constrained phone.
+     *
+     * Tested against Background specifically. -viewDidLoad runs inside
+     * -application:didFinishLaunchingWithOptions:, where the state is always
+     * Inactive rather than Active, so "not Active" would take this branch on
+     * every single cold launch and then immediately undo it. */
+    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground)
+        [self appDidEnterBackground:nil];
+}
+
+- (void)launchEngine {
+    if (!_frame) return;
+    _launchShutdownRequested = NO;
+
+    _engine = [[VMEngine alloc] initWithInstanceID:self.instanceID];
+    if (![_engine start]) {
+        [self append:@"[vm] emulator failed to start"];
+        [self appendConsole:[_engine takePendingConsoleText]];
+        _engine = nil;
+        [self refreshRunControls];
+        [self reportBringUpProblem:@"The machine could not be started."];
+        return;
+    }
+
+    [self applySettingsToEngine];
+    [self applyPauseState];
+    [self refreshRunControls];
+
+    /*
+     * WHY THIS IS AN ALERT AND NOT A LOG LINE.
+     *
+     * Everything else on this screen reports through -append:, which goes to
+     * the guest console -- and the console is gated behind developer mode. So
+     * a firmware bring-up that failed used to be, for an ordinary user, a
+     * black screen and a 10 pt grey word. The reason exists; it just never
+     * arrived. -bringUpNote is non-nil exactly when there is firmware and
+     * something about it needs saying, so it is shown where it cannot be
+     * missed.
+     */
+    NSString *note = [_engine bringUpNote];
+    if (note.length) {
+        _lastBringUpNote = note;      /* -tick: watches for it to CHANGE */
+        [self reportBringUpProblem:note];
+    }
+}
+
+/* One place, so every reason reaches the user the same way. */
+- (void)reportBringUpProblem:(NSString *)reason {
+    if (!reason.length) return;
+    [self append:[@"[vm] " stringByAppendingString:reason]];
+    if (!self.viewIfLoaded.window) return;   /* not on screen: the log has it */
+
+    /*
+     * THE TITLE HAS TO FOLLOW WHAT IS RUNNING, not merely that something needs
+     * saying. A firmware boot can succeed and still owe the user a sentence --
+     * most of the settings switches never reach the machine, and that is now
+     * reported here -- so titling every such sentence "Not running iPhone OS"
+     * would be exactly the kind of confident wrong claim this alert exists to
+     * prevent. Asked of the engine, which knows.
+     */
+    BOOL preparing = [_engine isPreparingRootFilesystem];
+    if (preparing) return; // The progress overlay is sufficient; do not block automatic boot with an alert.
+    NSString *title = preparing        ? @"Preparing iPhone OS"
+                    : [_engine isRunningFirmware] ? @"Running iPhone OS"
+                                                  : @"Not running iPhone OS";
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:title
+                         message:reason
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)dealloc {
+    if (_restoreIdleTimer)
+        [UIApplication sharedApplication].idleTimerDisabled =
+            _previousIdleTimerDisabled;
+    [self restoreSystemPopGestures];
+    [self endCheckpointBackgroundTask];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [_link invalidate];
+    [_engine stop];
+    free(_frame);
+}
+
+/*
+ * Saving writes and fsyncs the complete machine state before it publishes the
+ * one-shot restore marker. That transaction is deliberately atomic, but it is
+ * large enough that an immediate screen lock can otherwise suspend the app in
+ * the middle and leave the user staring at "Saving" until the next foreground
+ * transition. Ask iOS for its bounded background grace period. This is not a
+ * promise of unlimited execution time: expiration merely ends the assertion;
+ * the partial-file/marker protocol remains the authority on whether a save is
+ * valid.
+ */
+- (void)beginCheckpointBackgroundTask {
+    if (_checkpointBackgroundTask != UIBackgroundTaskInvalid) return;
+
+    UIApplication *application = [UIApplication sharedApplication];
+    __weak EmulatorViewController *weakSelf = self;
+    UIBackgroundTaskIdentifier task = [application
+        beginBackgroundTaskWithName:@"Saving machine"
+                  expirationHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            EmulatorViewController *strongSelf = weakSelf;
+            if (strongSelf) [strongSelf endCheckpointBackgroundTask];
+        });
+    }];
+    _checkpointBackgroundTask = task;
+}
+
+- (void)endCheckpointBackgroundTask {
+    UIBackgroundTaskIdentifier task = _checkpointBackgroundTask;
+    if (task == UIBackgroundTaskInvalid) return;
+    _checkpointBackgroundTask = UIBackgroundTaskInvalid;
+    [[UIApplication sharedApplication] endBackgroundTask:task];
+}
+
+- (void)setCheckpointSaving:(BOOL)saving {
+    _savingCheckpoint = saving;
+    const BOOL busy = _savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested;
+    /* Normal shutdown may never get a working guest UI. Keep its escape hatch. */
+    self.navigationItem.leftBarButtonItem.enabled =
+        !_forcePoweringOff;
+    _screen.userInteractionEnabled = !busy;
+    _keys.userInteractionEnabled = !busy;
+    _toolbar.userInteractionEnabled = !busy;
+    _dock.userInteractionEnabled = !busy;
+    if (busy) [_homeButton releasePress];
+    [self refreshModernControls];
+    [self refreshPrepareOverlay];
+}
+
+- (void)setRestarting:(BOOL)restarting {
+    _restarting = restarting;
+    [self setCheckpointSaving:_savingCheckpoint];
+}
+
+- (void)backTapped:(id)sender {
+    if (_forcePoweringOff) return;
+    if (_savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested) {
+        [self forcePowerOffTapped:sender];
+        return;
+    }
+    if (!_engine || !self.instanceID.length) {
+        [self saveAndCloseTapped:sender];
+        return;
+    }
+    UIAlertController *choice = [UIAlertController
+        alertControllerWithTitle:@"Close this machine"
+                         message:@"Save to resume where you left off, or shut down iPhone OS for a fresh boot next time."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak EmulatorViewController *weakSelf = self;
+    [choice addAction:[UIAlertAction actionWithTitle:@"Save & close"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+            [weakSelf saveAndCloseTapped:nil];
+        }]];
+    [choice addAction:[UIAlertAction actionWithTitle:@"Shut down"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+            [weakSelf shutDownTapped:nil];
+        }]];
+    [choice addAction:[UIAlertAction actionWithTitle:@"Force Power Off…"
+        style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+            [weakSelf forcePowerOffTapped:nil];
+        }]];
+    [choice addAction:[UIAlertAction actionWithTitle:@"Cancel"
+        style:UIAlertActionStyleCancel handler:nil]];
+    choice.popoverPresentationController.barButtonItem =
+        self.navigationItem.leftBarButtonItem;
+    [self presentViewController:choice animated:YES completion:nil];
+}
+
+- (void)shutDownTapped:(id)sender {
+    (void)sender;
+    [self shutDownGuestAndRestart:NO];
+}
+
+- (void)shutDownGuestAndRestart:(BOOL)restart {
+    if (_savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested) return;
+    _shuttingDown = YES;
+    _userPaused = NO;
+    [self applyPauseState];
+    [self setCheckpointSaving:NO]; /* update all busy controls and overlay */
+    _previousIdleTimerDisabled =
+        [UIApplication sharedApplication].idleTimerDisabled;
+    _restoreIdleTimer = YES;
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
+    __weak EmulatorViewController *weakSelf = self;
+    [_engine shutDownAndStopWithCompletion:^(BOOL finished, NSString *message) {
+        EmulatorViewController *screen = weakSelf;
+        if (!screen || screen->_forcePowerOffRequested) return;
+        void (^finish)(void) = ^{
+            if (screen->_forcePowerOffRequested) return;
+            [UIApplication sharedApplication].idleTimerDisabled =
+                screen->_previousIdleTimerDisabled;
+            screen->_restoreIdleTimer = NO;
+            screen->_shuttingDown = NO;
+            [screen setCheckpointSaving:NO];
+            if (finished) {
+                if (restart) {
+                    /* The shutdown completion owns no disk or CPU anymore.
+                     * Keep its powered-off witness for cold-boot recovery. */
+                    [screen appendConsole:[screen->_engine takePendingConsoleText]];
+                    screen->_engine = nil;
+                    screen->_lastBringUpNote = nil;
+                    [screen launchEngine];
+                    [screen refreshStatusLine];
+                    return;
+                }
+                void (^afterShutdown)(void) = [screen.guestShutdownCompletion copy];
+                screen.guestShutdownCompletion = nil;
+                [screen.navigationController popViewControllerAnimated:!afterShutdown];
+                /* UIKit must finish removing this controller before the install
+                 * workflow pushes another. Even a nonanimated pop can still be
+                 * updating the navigation stack inside this callback. */
+                if (afterShutdown)
+                    dispatch_async(dispatch_get_main_queue(), afterShutdown);
+                return;
+            }
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:restart ? @"Restart not completed" : @"Shutdown not completed"
+                                 message:message
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                style:UIAlertActionStyleDefault handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Force Power Off…"
+                style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+                    [weakSelf forcePowerOffTapped:nil];
+                }]];
+            [screen presentViewController:alert animated:YES completion:nil];
+        };
+        /* Shutdown can finish while its force-off confirmation is visible. */
+        if (screen.presentedViewController)
+            [screen dismissViewControllerAnimated:YES completion:finish];
+        else finish();
+    }];
+}
+
+- (void)forcePowerOffTapped:(id)sender {
+    (void)sender;
+    if (![self runtimeCanForcePowerOff]) return;
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Force Power Off?"
+        message:@"Stops without saving, even during boot. Unsaved work may be lost and the guest disk may need repair."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+        style:UIAlertActionStyleCancel handler:nil]];
+    __weak EmulatorViewController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Force Power Off"
+        style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+            [weakSelf forcePowerOff];
+        }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)forcePowerOff {
+    if (![self runtimeCanForcePowerOff]) return;
+    _forcePowerOffRequested = YES; /* also suppress any queued shutdown callback */
+    _forcePoweringOff = YES;
+    _shuttingDown = NO;
+    _restarting = NO;
+    self.guestShutdownCompletion = nil; /* NEVER continue jailbreak after force-off */
+    if (!_restoreIdleTimer) {
+        _previousIdleTimerDisabled = [UIApplication sharedApplication].idleTimerDisabled;
+        _restoreIdleTimer = YES;
+    }
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
+    [self beginCheckpointBackgroundTask];
+    [self setCheckpointSaving:NO];
+    __weak EmulatorViewController *weakSelf = self;
+    [_engine forcePowerOffWithCompletion:^(BOOL finished, NSString *message) {
+        EmulatorViewController *screen = weakSelf;
+        if (!screen) return;
+        [screen endCheckpointBackgroundTask];
+        [UIApplication sharedApplication].idleTimerDisabled = screen->_previousIdleTimerDisabled;
+        screen->_restoreIdleTimer = NO;
+        screen->_forcePoweringOff = NO;
+        [screen setCheckpointSaving:NO];
+        if (finished) {
+            if (screen->_packageSetupRequested && screen.packageSetupRequest) {
+                void (^setup)(void) = [screen.packageSetupRequest copy];
+                screen->_packageSetupRequested = NO;
+                [screen.navigationController popViewControllerAnimated:NO];
+                dispatch_async(dispatch_get_main_queue(), setup);
+                return;
+            }
+            [screen.navigationController popViewControllerAnimated:YES];
+            return;
+        }
+        /* Stay stopped if invalidation failed. Back can retry without ever
+         * opening a second disk owner or claiming a clean shutdown. */
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Machine stopped"
+            message:message preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Retry"
+            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+                [weakSelf forcePowerOff];
+            }]];
+        [screen presentViewController:alert animated:YES completion:nil];
+    }];
+}
+
+- (void)saveAndCloseTapped:(id)sender {
+    (void)sender;
+    if (_savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested) return;
+    self.guestShutdownCompletion = nil; /* saving cancels a pending install */
+
+    /* A halted machine has already released its s5l8900_t, so there is no
+     * state left to serialize. Leaving is still safe and must not trap the
+     * user behind a save button that can never succeed. */
+    if (!_engine) {
+        [self.navigationController popViewControllerAnimated:YES];
+        return;
+    }
+
+    /* The built-in demo has no firmware disk or resumable CPU state. Close
+     * it directly rather than showing a checkpoint failure for a demo. */
+    if (![_engine isRunning] || ![_engine isRunningFirmware]) {
+        [self forcePowerOff];
+        return;
+    }
+
+    [self beginCheckpointBackgroundTask];
+    [self setCheckpointSaving:YES];
+    __weak EmulatorViewController *weakSelf = self;
+    [_engine saveCheckpointAndStopWithCompletion:
+        ^(BOOL saved, NSString *message) {
+            EmulatorViewController *strongSelf = weakSelf;
+            if (!strongSelf || strongSelf->_forcePowerOffRequested) return;
+            [strongSelf endCheckpointBackgroundTask];
+            if (saved) {
+                [strongSelf.navigationController
+                    popViewControllerAnimated:YES];
+                return;
+            }
+
+            [strongSelf setCheckpointSaving:NO];
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"Machine Not Saved"
+                                 message:message.length
+                                     ? message
+                                     : @"The checkpoint could not be saved."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Keep Running"
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:nil]];
+            [alert addAction:[UIAlertAction
+                actionWithTitle:@"Leave Without Saving"
+                          style:UIAlertActionStyleDestructive
+                        handler:^(__unused UIAlertAction *action) {
+                            [strongSelf forcePowerOff];
+                        }]];
+            [strongSelf presentViewController:alert animated:YES completion:nil];
+        }];
+}
+
+- (void)appDidEnterBackground:(NSNotification *)notification {
+    (void)notification;
+    _inBackground = YES;
+    [self applyPauseState];
+}
+
+- (void)appWillEnterForeground:(NSNotification *)notification {
+    (void)notification;
+    _inBackground = NO;
+    [self applyPauseState];
+}
+
+- (void)appDidBecomeActive:(NSNotification *)notification {
+    (void)notification;
+    /* Safety reconciliation for scene/application lifecycle edge cases. It is
+     * idempotent after WillEnterForeground and does nothing for a user pause. */
+    _inBackground = NO;
+    [self applyPauseState];
+}
+
+- (void)settingsDidChange:(NSNotification *)notification {
+    (void)notification;
+    /* Reapply this session's values, not newly edited app defaults. Developer
+     * mode remains app-wide and still changes the toolbar/console visibility. */
+    [self applySettingsToEngine];
+    [self applyPauseState];
+    [self refreshStatusLine];
+    /* Developer mode adds and removes the Console button, so the toolbar has
+     * to be rebuilt rather than only refreshed — _toolbarBuilt is what stops
+     * -refreshRunControls short-circuiting when the play/pause glyph has not
+     * changed, which is the usual case here. */
+    _toolbarBuilt = NO;
+    [self applyInterfaceStyle];
+    [self refreshRunControls];
+    /* The inline-console setting changes the layout, not just the chrome. */
+    [self.view setNeedsLayout];
+}
+
+#pragma mark - Run state
+
+/*
+ * The single writer of the engine's pause flag. Pause has two causes — the
+ * user asked, or the app is actually in the background and the setting says
+ * to stop — and
+ * folding them here is what stops a return to the foreground from resuming a
+ * machine the user deliberately paused.
+ *
+ * Backgrounding is honoured through a setting because a user who has turned
+ * "pause in background" off is asking for the interpreter to keep going,
+ * and the settings screen states the consequence.
+ */
+- (void)applyPauseState {
+    const BOOL backgroundPause =
+        _inBackground && (_shuttingDown ||
+                         _sessionPausesInBackground);
+    const BOOL paused = _userPaused || backgroundPause;
+
+    NSString *reason = _userPaused ? @"user"
+                     : backgroundPause ? @"background"
+                                       : nil;
+    [_engine setPaused:paused reason:reason];
+
+    /*
+     * The link stops only when the app is hidden — NOT when the machine is
+     * paused. It is the only thing that drains the engine's UART buffer, and
+     * the emulator thread is mid-chunk when a pause request lands, so it still
+     * publishes one last time afterwards: stopping the link on pause would
+     * strand exactly the output that says why the machine was paused. A tick
+     * against a paused engine costs a -copyFrameInto: that returns NO and a
+     * drain that returns nil.
+     */
+    _link.paused = _inBackground;
+
+    [self refreshRunControls];
+}
+
+- (void)applySettingsToEngine {
+    [_engine setInstructionCap:_sessionInstructionCap];
+}
+
+/* The toolbar is built from what the engine says, not from what was last
+ * tapped, so a machine that stopped on its own — a halt, or a reached
+ * instruction cap — is shown as stopped without anything having to notice. */
+- (void)refreshRunControls {
+    [self refreshModernControls];
+    const BOOL showPlay = (_engine == nil) || [_engine isPaused] ||
+                          ![_engine isRunning];
+    if (_toolbarBuilt && showPlay == _toolbarShowsPlay) return;
+    _toolbarShowsPlay = showPlay;
+    _toolbarBuilt = YES;
+
+    UIBarButtonItem *playPause = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:(showPlay ? UIBarButtonSystemItemPlay
+                                              : UIBarButtonSystemItemPause)
+                             target:self
+                             action:@selector(playPauseTapped:)];
+    UIBarButtonItem *reset = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                             target:self
+                             action:@selector(resetTapped:)];
+    UIBarButtonItem *space = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
+                             target:nil
+                             action:nil];
+    UIBarButtonItem *settings = [[UIBarButtonItem alloc]
+        initWithTitle:@"Settings"
+                style:UIBarButtonItemStylePlain
+               target:self
+               action:@selector(settingsTapped:)];
+
+    /*
+     * Console is a DEVELOPER-MODE item. Somebody who has not asked for the
+     * guest's serial log does not get a button to a screen full of kernel
+     * output; somebody who has gets it one tap away. The toolbar is rebuilt
+     * whenever settings change, so toggling developer mode adds and removes
+     * this without leaving the screen.
+     */
+    NSMutableArray<UIBarButtonItem *> *items =
+        [NSMutableArray arrayWithObjects:playPause, reset, space, nil];
+    if ([[VMSettings sharedSettings] developerMode]) {
+        [items addObject:[[UIBarButtonItem alloc]
+            initWithTitle:@"Console"
+                    style:UIBarButtonItemStylePlain
+                   target:self
+                   action:@selector(consoleTapped:)]];
+    }
+    [items addObject:settings];
+    [_toolbar setItems:items animated:NO];
+}
+
+- (void)consoleTapped:(id)sender {
+    (void)sender;
+    VMConsoleViewController *vc = [[VMConsoleViewController alloc] init];
+    /* A snapshot of what has accumulated, not a live binding: the emulator
+     * thread appends to _consoleText continuously, and handing that mutable
+     * string straight to another view would be a data race across a screen
+     * transition. */
+    vc.text = [NSString stringWithFormat:@"%@\n\n%@", _stats.text ?: @"", _consoleText ?: @""];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+- (void)playPauseTapped:(id)sender {
+    (void)sender;
+    if (_savingCheckpoint || _restarting) return;
+
+    /* A halted machine cannot resume because its s5l8900_t is gone. Older
+     * builds silently routed Play through Reset, disguising a terminal stop as
+     * a failed resume and destroying the evidence. Ask before a fresh boot. */
+    if (!_engine || ![_engine isRunning]) {
+        NSString *state = _engine ? [_engine statusDescription] : @"no machine";
+        NSString *message = [NSString stringWithFormat:
+            @"The machine cannot resume because it is %@. Restarting performs "
+             "a fresh boot; it does not continue the stopped CPU state.", state];
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Machine Stopped"
+                             message:message
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+        __weak EmulatorViewController *weakSelf = self;
+        [alert addAction:[UIAlertAction
+            actionWithTitle:@"Restart"
+                      style:UIAlertActionStyleDestructive
+                    handler:^(__unused UIAlertAction *action) {
+                        [weakSelf resetTapped:nil];
+                    }]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    /* Play clears a stale lifecycle pause in one tap instead of layering a new
+     * user pause on top of an engine which is already suspended. */
+    _userPaused = ![_engine isPaused];
+    [self applyPauseState];
+    [self refreshStatusLine];
+}
+
+- (void)resetTapped:(id)sender {
+    (void)sender;
+    if (!_frame || _savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested) return;
+
+    /* A user restart must let iPhone OS flush its filesystem. Tearing down a
+     * running kernel here lost catalog updates during first-boot installation.
+     * Keep the existing immediate path only for the demo or an already halted
+     * engine, including the automatic transition after firmware preparation. */
+    if ([_engine isRunningFirmware] && [_engine isRunning]) {
+        [self shutDownGuestAndRestart:YES];
+        return;
+    }
+
+    /* Take what the outgoing machine has already said before letting go of it.
+     * Its final publication — the last of the guest's output, and the engine's
+     * own "stopped" line — happens on a thread whose only reader is about to
+     * be dropped, so anything not collected here is lost. */
+    [self appendConsole:[_engine takePendingConsoleText]];
+    [self append:@"\n[vm] reset requested; waiting for the old machine"];
+
+    /* The completion is the ownership boundary: it runs only after the old
+     * machine has been freed and its writable work image closed. Starting the
+     * replacement sooner allows two guests to write one HFS+ volume because
+     * fcntl record locks are per process, not per file descriptor. */
+    [self setRestarting:YES];
+    _userPaused = NO;
+    _haveTouch = NO;
+    VMEngine *oldEngine = _engine;
+    if (!oldEngine) {
+        _lastBringUpNote = nil;
+        [self launchEngine];
+        [self setRestarting:NO];
+        [self refreshStatusLine];
+        return;
+    }
+
+    __weak EmulatorViewController *weakSelf = self;
+    __weak VMEngine *weakOldEngine = oldEngine;
+    [oldEngine stopWithCompletion:^{
+        EmulatorViewController *strongSelf = weakSelf;
+        VMEngine *stoppedEngine = weakOldEngine;
+        if (!strongSelf || !stoppedEngine ||
+            strongSelf->_engine != stoppedEngine || strongSelf->_forcePowerOffRequested) return;
+
+        [strongSelf appendConsole:[stoppedEngine takePendingConsoleText]];
+        strongSelf->_engine = nil;
+        strongSelf->_lastBringUpNote = nil;
+        [strongSelf append:
+            @"[vm] reset: old machine released; starting replacement"];
+        [strongSelf launchEngine];
+        [strongSelf setRestarting:NO];
+        [strongSelf refreshStatusLine];
+    }];
+}
+
+- (void)settingsTapped:(id)sender {
+    (void)sender;
+
+    if (_savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested) return;
+    VMRuntimeSettingsViewController *settings =
+        [[VMRuntimeSettingsViewController alloc] init];
+    settings.runtimeDelegate = self;
+    settings.machineName = self.title ?: @"Current machine";
+    settings.showsDeveloperControls = [[VMSettings sharedSettings] developerMode];
+    /* Use the same instance-derived path as the existing snapshot owner. */
+    settings.snapshotsDirectory = [self snapshotsDirectory];
+    settings.usbTransport = [_engine usbTransport];
+    settings.instanceID = self.instanceID;
+    UINavigationController *nav = [[UINavigationController alloc]
+        initWithRootViewController:settings];
+    // The emulator screen is black; a white sheet over it would be a jolt.
+    if (_legacyInterface) nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    /* Session changes are immediate through the delegate. Dismissal never
+     * saves app defaults, restarts the guest or changes another machine. */
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+#pragma mark - Current-session settings
+
+- (void)openRuntimePackages {
+    if (![self runtimeCanControlGuest] || [_engine isPaused] || self.presentedViewController) return;
+    VMPackageManagerViewController *packages = [[VMPackageManagerViewController alloc]
+        initWithTransport:_engine.usbTransport instanceID:self.instanceID];
+    packages.modalPresentationStyle = UIModalPresentationFullScreen;
+    __weak EmulatorViewController *weakSelf = self;
+    __weak VMPackageManagerViewController *weakPackages = packages;
+    packages.setupRequest = ^{
+        EmulatorViewController *owner = weakSelf;
+        VMPackageManagerViewController *workspace = weakPackages;
+        if (!owner || !workspace || ![owner runtimeCanForcePowerOff] || !owner.packageSetupRequest) return;
+        UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Set up Packages?"
+            message:@"Restart this machine to set up Packages. Unsaved work may be lost."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Power Off & Set Up" style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *action) {
+                [owner dismissViewControllerAnimated:YES completion:^{
+                    owner->_packageSetupRequested = YES;
+                    [owner forcePowerOff];
+                }];
+            }]];
+        [workspace presentViewController:confirm animated:YES completion:nil];
+    };
+    [self presentViewController:packages animated:YES completion:nil];
+}
+
+- (NSString *)deviceButtonUnavailableReason {
+    if (![self runtimeCanControlGuest]) return @"Device buttons are unavailable while the machine is stopped or busy.";
+    /* The instance method is a diagnostic history (including "nothing sent
+     * yet"), not a capability gate. Using it here would prevent the FIRST press. */
+    return [VMEngine buttonUnavailableReason];
+}
+- (BOOL)deviceSilent { return [_engine isButtonPressed:VMButtonRingerSilent]; }
+- (void)setDeviceButton:(VMButton)button pressed:(BOOL)pressed {
+    /* Releases must always reach the engine, even after a pause/busy transition. */
+    if (pressed && ([self deviceButtonUnavailableReason].length || [_engine isPaused])) return;
+    [_engine setButton:button pressed:pressed];
+}
+
+- (BOOL)runtimeCanControlGuest {
+    return [_engine isRunning] && !_savingCheckpoint && !_restarting && !_shuttingDown && !_forcePowerOffRequested;
+}
+- (BOOL)runtimeCanForcePowerOff {
+    /* No guest-ready/isRunning/touch requirement: half-booted and halted guests
+     * must be stoppable too. Checkpoints/restarts retain their disk ownership. */
+    return _engine && !_forcePoweringOff &&
+        self.navigationController.topViewController == self;
+}
+- (BOOL)runtimeCanShutDown {
+    return [self runtimeCanControlGuest] && [_engine isRunningFirmware];
+}
+- (BOOL)runtimePaused { return [_engine isPaused]; }
+- (BOOL)runtimeMicrophoneEnabled { return [_engine microphoneEnabled]; }
+- (NSString *)runtimeAudioStatus { return [_engine audioStatus]; }
+- (void)setRuntimeMicrophoneEnabled:(BOOL)enabled completion:(void (^)(BOOL, NSString *))completion {
+    [_engine setMicrophoneEnabled:enabled completion:completion];
+}
+- (void)setRuntimePaused:(BOOL)paused {
+    if (![self runtimeCanControlGuest]) return;
+    _userPaused = paused;
+    [self applyPauseState];
+    [self refreshStatusLine];
+}
+- (BOOL)runtimePausesInBackground { return _sessionPausesInBackground; }
+- (void)setRuntimePausesInBackground:(BOOL)pauses {
+    _sessionPausesInBackground = pauses;
+    [self applyPauseState];
+}
+- (BOOL)runtimeInlineConsole { return _sessionInlineConsole; }
+- (void)setRuntimeInlineConsole:(BOOL)enabled {
+    _sessionInlineConsole = enabled;
+    [self.view setNeedsLayout];
+}
+- (uint64_t)runtimeInstructionCap { return _sessionInstructionCap; }
+- (void)setRuntimeInstructionCap:(uint64_t)cap {
+    _sessionInstructionCap = cap;
+    [self applySettingsToEngine];
+}
+- (void)performRuntimeAction:(VMRuntimeAction)action {
+    if (action == VMRuntimeActionForcePowerOff) {
+        [self forcePowerOffTapped:nil];
+        return;
+    }
+    if (_savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested ||
+        self.navigationController.topViewController != self) return;
+    switch (action) {
+        case VMRuntimeActionSaveAndClose: [self saveAndCloseTapped:nil]; break;
+        case VMRuntimeActionShutDown:
+            if ([self runtimeCanShutDown]) [self shutDownTapped:nil];
+            break;
+        case VMRuntimeActionRestart: [self resetTapped:nil]; break;
+        case VMRuntimeActionForcePowerOff: break; /* handled above */
+    }
+}
+
+#pragma mark - Snapshots
+
+/*
+ * Derived from the same instance id the engine was built with, through the
+ * same store that CREATES the machine's directory, rather than joined by hand
+ * here. VMEngine.m states the rule this follows: one derivation, and the C
+ * half is the one that can be tested and the one that refuses an identifier
+ * which is not sixteen hex digits.
+ *
+ * nil when there is no identity, which the list treats as "no snapshots" --
+ * the correct answer for the built-in demo guest, which has no disk of its own
+ * and therefore nothing a saved state could be about.
+ */
+- (NSString *)snapshotsDirectory {
+    if (!self.instanceID.length) return nil;
+    NSString *machine =
+        [[VMInstanceStore sharedStore] directoryForInstanceWithID:self.instanceID];
+    if (!machine.length) return nil;
+    char out[VM_FW_BOOT_PATH_CAPACITY];
+    if (vm_snapshot_dir(machine.fileSystemRepresentation, out, sizeof out)
+            != VM_SNAPSHOT_OK)
+        return nil;
+    return [NSString stringWithUTF8String:out];
+}
+
+/*
+ * Deliberately the ONLY delegate method implemented so far.
+ *
+ * -takeSnapshot... and -openSnapshot... are optional, and leaving them absent
+ * makes the list say "not available" instead of offering a control that would
+ * half-work. Restoring an older saved state needs the copy-on-write overlay in
+ * VMSnapshotCow.h, and without it a restore writes RAM from one moment over a
+ * disk from another -- the quiet guest-filesystem corruption VMFirmwareBoot.h
+ * warns about, which fsck exists to catch and which a resume never runs fsck
+ * to catch. A stub that silently succeeded would be the worst of the options.
+ */
+- (NSString *)snapshotListOpenUnavailableReason:(VMSnapshotListViewController *)list {
+    (void)list;
+    return @"Opening a saved state is not available yet. The part that "
+           @"remembers what the guest's disk looked like at the time is still "
+           @"being built, and without it a restore would put this machine's "
+           @"memory back while leaving its disk where it is now.";
+}
+
+- (NSString *)snapshotListTakeUnavailableReason:(VMSnapshotListViewController *)list {
+    (void)list;
+    /*
+     * The automatic Back checkpoint is safe because the machine stops at the
+     * exact boundary it saves, so its live work image can never move away from
+     * that state before the one-shot restore. A named historical snapshot has
+     * a harder contract: it must remain restorable while the machine keeps
+     * running and changing that image. The COW recorder exists, but this UI has
+     * not yet completed that lifecycle, so claiming named saves here would
+     * still be false.
+     */
+    return @"Named saved states are not available yet. Leaving the machine "
+           @"screen can safely write one automatic resume point because it "
+           @"stops the machine immediately afterward. A named snapshot must "
+           @"remain valid while the machine keeps changing its disk, and that "
+           @"disk-history lifecycle is not integrated here yet.";
+}
+
+#pragma mark - Layout
+
+- (UIButton *)dockButtonWithSymbol:(NSString *)symbol label:(NSString *)label action:(SEL)action {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIImage *icon = [UIImage systemImageNamed:symbol];
+    if (!icon && [symbol isEqualToString:@"gearshape"]) icon = [UIImage systemImageNamed:@"gear"];
+    [button setImage:icon forState:UIControlStateNormal];
+    [button setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:23
+        weight:UIImageSymbolWeightRegular] forImageInState:UIControlStateNormal];
+    button.tintColor = UIColor.labelColor;
+    button.backgroundColor = UIColor.tertiarySystemFillColor;
+    button.layer.cornerRadius = 24;
+    button.accessibilityLabel = label;
+    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [_dock addSubview:button];
+    return button;
+}
+
+- (void)buildModernControls {
+    _dock = [UIView new];
+    _dock.backgroundColor = UIColor.secondarySystemBackgroundColor;
+    _dock.layer.cornerRadius = 38;
+    _dock.accessibilityIdentifier = @"s5lbox.modern-dock";
+    [self.view addSubview:_dock];
+    _settingsButton = [self dockButtonWithSymbol:@"gearshape" label:@"Machine settings" action:@selector(settingsTapped:)];
+    _settingsButton.accessibilityIdentifier = @"s5lbox.dock.settings";
+    _deviceControlsButton = [self dockButtonWithSymbol:@"slider.horizontal.3" label:@"Device controls"
+        action:@selector(deviceControlsTapped:)];
+    _deviceControlsButton.accessibilityHint = @"Sleep, silent mode, volume, and session controls.";
+    _deviceControlsButton.accessibilityIdentifier = @"s5lbox.dock.controls";
+    _homeButton = [[VMHardwareButton alloc] initWithFrame:CGRectZero];
+    [_homeButton setImage:[UIImage systemImageNamed:@"square"] forState:UIControlStateNormal];
+    [_homeButton setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:25
+        weight:UIImageSymbolWeightRegular] forImageInState:UIControlStateNormal];
+    _homeButton.tintColor = UIColor.labelColor;
+    _homeButton.backgroundColor = UIColor.systemBackgroundColor;
+    _homeButton.layer.cornerRadius = 32;
+    _homeButton.layer.borderWidth = 2;
+    _homeButton.accessibilityLabel = @"Guest Home button";
+    _homeButton.accessibilityHint = @"Press to go Home. Press and hold for the guest's hold action.";
+    _homeButton.accessibilityIdentifier = @"s5lbox.dock.home";
+    __weak EmulatorViewController *weakSelf = self;
+    _homeButton.pressChanged = ^(BOOL pressed) { [weakSelf setDeviceButton:VMButtonHome pressed:pressed]; };
+    [_dock addSubview:_homeButton];
+    UITapGestureRecognizer *marginTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(toggleHostControls)];
+    marginTap.delegate = self;
+    marginTap.cancelsTouchesInView = NO;
+    [self.view addGestureRecognizer:marginTap];
+    _machineTitle = [UILabel new];
+    _machineTitle.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    _machineTitle.textAlignment = NSTextAlignmentCenter;
+    _machineTitle.lineBreakMode = NSLineBreakByTruncatingTail;
+    _machineStatus = [UILabel new];
+    _machineStatus.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption2];
+    _machineStatus.textColor = UIColor.secondaryLabelColor;
+    _machineStatus.textAlignment = NSTextAlignmentCenter;
+    UIStackView *titleContent = [[UIStackView alloc] initWithArrangedSubviews:@[_machineTitle, _machineStatus]];
+    titleContent.axis = UILayoutConstraintAxisVertical;
+    titleContent.spacing = 1;
+    titleContent.translatesAutoresizingMaskIntoConstraints = NO;
+    _machineHeading = [VMMachineHeadingView new];
+    [_machineHeading setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+        forAxis:UILayoutConstraintAxisHorizontal];
+    [_machineHeading addSubview:titleContent];
+    [NSLayoutConstraint activateConstraints:@[
+        [titleContent.leadingAnchor constraintEqualToAnchor:_machineHeading.leadingAnchor],
+        [titleContent.trailingAnchor constraintEqualToAnchor:_machineHeading.trailingAnchor],
+        [titleContent.centerYAnchor constraintEqualToAnchor:_machineHeading.centerYAnchor],
+        [titleContent.heightAnchor constraintLessThanOrEqualToAnchor:_machineHeading.heightAnchor]
+    ]];
+    _machineHeading.isAccessibilityElement = YES;
+    _machineHeading.accessibilityTraits = UIAccessibilityTraitHeader;
+    [self updateMachineHeadingFonts];
+}
+
+- (void)updateMachineHeadingFonts {
+    // Keep both lines inside the navigation bar at accessibility text sizes.
+    _machineTitle.font = [UIFont systemFontOfSize:MIN(20, [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline
+        compatibleWithTraitCollection:self.traitCollection].pointSize) weight:UIFontWeightSemibold];
+    _machineStatus.font = [UIFont systemFontOfSize:MIN(13, [UIFont preferredFontForTextStyle:UIFontTextStyleCaption2
+        compatibleWithTraitCollection:self.traitCollection].pointSize)];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    if (![previousTraitCollection.preferredContentSizeCategory isEqualToString:self.traitCollection.preferredContentSizeCategory])
+        [self updateMachineHeadingFonts];
+}
+
+- (void)applyInterfaceStyle {
+    [_homeButton releasePress];
+    _legacyInterface = VMSettings.sharedSettings.legacyEmulatorUI;
+    BOOL homeOnly = !_legacyInterface && VMSettings.sharedSettings.homeOnlyEmulatorUI;
+    if (homeOnly != _homeOnlyInterface) _controlsRevealed = NO;
+    _homeOnlyInterface = homeOnly;
+    BOOL minimal = homeOnly && !_controlsRevealed;
+    if (self.navigationController.topViewController == self)
+        [self.navigationController setNavigationBarHidden:minimal animated:NO];
+    _settingsButton.hidden = _deviceControlsButton.hidden = minimal;
+    _dock.backgroundColor = minimal ? UIColor.clearColor : UIColor.secondarySystemBackgroundColor;
+    _homeButton.accessibilityCustomActions = homeOnly ? @[
+        [[UIAccessibilityCustomAction alloc] initWithName:minimal ? @"Show controls" : @"Hide controls"
+            target:self selector:@selector(toggleHostControls)]] : nil;
+    _keys.hidden = _stats.hidden = _toolbar.hidden = !_legacyInterface;
+    _dock.hidden = _legacyInterface;
+    _screen.layer.borderWidth = _legacyInterface ? 1 : 0.5;
+    _screen.layer.borderColor = (_legacyInterface ? [UIColor colorWithWhite:0.25 alpha:1] : UIColor.separatorColor).CGColor;
+    self.view.backgroundColor = _legacyInterface ? UIColor.blackColor : UIColor.systemBackgroundColor;
+    self.navigationItem.titleView = _legacyInterface ? nil : _machineHeading;
+    self.navigationItem.rightBarButtonItem = !_legacyInterface && VMSettings.sharedSettings.developerMode
+        ? [[UIBarButtonItem alloc] initWithTitle:@"Console" style:UIBarButtonItemStylePlain
+            target:self action:@selector(consoleTapped:)] : nil;
+    [self refreshModernControls];
+    [self.view setNeedsLayout];
+    [self setNeedsStatusBarAppearanceUpdate];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldReceiveTouch:(UITouch *)touch {
+    (void)gesture;
+    if (!_homeOnlyInterface || self.presentedViewController) return NO;
+    UIView *view = touch.view;
+    if ([view isDescendantOfView:_screen] || [view isDescendantOfView:_prepareScrim] ||
+        [view isDescendantOfView:_console]) return NO;
+    for (; view && view != self.view; view = view.superview)
+        if ([view isKindOfClass:UIControl.class]) return NO;
+    return YES;
+}
+
+- (BOOL)toggleHostControls {
+    if (!_homeOnlyInterface) return NO;
+    _controlsRevealed = !_controlsRevealed;
+    [self applyInterfaceStyle];
+    UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, _homeButton);
+    return YES;
+}
+
+- (void)refreshModernControls {
+    if (!_dock || _legacyInterface) return;
+    _homeButton.enabled = ![self deviceButtonUnavailableReason].length && ![_engine isPaused];
+    NSString *status = _forcePowerOffRequested ? @"Powering off"
+        : _savingCheckpoint ? @"Saving" : _shuttingDown ? @"Shutting down"
+        : _restarting ? @"Restarting" : [_engine isPreparingRootFilesystem] ? @"Preparing"
+        : !_engine || [_engine isStarting] ? @"Starting" : [_engine isPaused] ? @"Paused"
+        : [_engine isRunning] ? @"Running" : @"Stopped";
+    _machineTitle.text = self.title ?: @"Machine";
+    _machineStatus.text = status;
+    _machineHeading.accessibilityLabel = [NSString stringWithFormat:@"%@, %@", _machineTitle.text, status];
+}
+
+- (void)deviceControlsTapped:(id)sender {
+    (void)sender;
+    if (_savingCheckpoint || _restarting || _shuttingDown || _forcePowerOffRequested || self.presentedViewController) return;
+    [_homeButton releasePress];
+    VMDeviceControlsViewController *controls = [VMDeviceControlsViewController new];
+    controls.controlDelegate = self;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:controls];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    if (@available(iOS 15.0, *)) {
+        nav.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.largeDetent];
+        nav.sheetPresentationController.prefersGrabberVisible = YES;
+    }
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)layoutModernInterface {
+    CGRect area = UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
+    area = CGRectInset(area, 12, 8);
+    BOOL landscape = area.size.width > area.size.height;
+    if (landscape) {
+        CGFloat height = MIN(236, area.size.height);
+        _dock.frame = CGRectMake(CGRectGetMaxX(area) - 76, CGRectGetMidY(area) - height / 2, 76, height);
+        _homeButton.frame = CGRectMake(6, (height - 64) / 2, 64, 64);
+        _settingsButton.frame = CGRectMake(14, 10, 48, 48);
+        _deviceControlsButton.frame = CGRectMake(14, height - 58, 48, 48);
+        area.size.width = MAX(0, area.size.width - 92);
+    } else {
+        CGFloat width = MIN(300, area.size.width);
+        _dock.frame = CGRectMake(CGRectGetMidX(area) - width / 2, CGRectGetMaxY(area) - 76, width, 76);
+        _homeButton.frame = CGRectMake((width - 64) / 2, 6, 64, 64);
+        _settingsButton.frame = CGRectMake(14, 14, 48, 48);
+        _deviceControlsButton.frame = CGRectMake(width - 62, 14, 48, 48);
+        area.size.height = MAX(0, area.size.height - 88);
+    }
+    _homeButton.layer.borderColor = UIColor.systemBlueColor.CGColor;
+    _screen.layer.borderColor = UIColor.separatorColor.CGColor;
+    BOOL inlineConsole = _sessionInlineConsole && VMSettings.sharedSettings.developerMode &&
+        (!_homeOnlyInterface || _controlsRevealed);
+    CGFloat band = inlineConsole ? floor(area.size.height * 0.62) : area.size.height;
+    CGFloat scale = MAX(0, MIN(area.size.width / VM_FB_WIDTH, band / VM_FB_HEIGHT));
+    CGFloat width = VM_FB_WIDTH * scale, height = VM_FB_HEIGHT * scale;
+    _screen.frame = CGRectMake(CGRectGetMidX(area) - width / 2, area.origin.y + (band - height) / 2, width, height);
+    _prepareScrim.frame = _screen.frame;
+    _prepareLabel.frame = CGRectMake(width * .1, height / 2 - 50, width * .8, 86);
+    _prepareBar.frame = CGRectMake(width * .1, height / 2 + 44, width * .8, 4);
+    _console.hidden = !inlineConsole;
+    _console.frame = inlineConsole ? CGRectMake(area.origin.x, area.origin.y + band + 6,
+        area.size.width, MAX(0, area.size.height - band - 6)) : CGRectZero;
+}
+
+/*
+ * The preparing overlay, refreshed on the same throttled tick as the status
+ * line -- eight frames is far finer than a 433 MB copy changes on.
+ *
+ * -1.0 from the engine means "running but nothing reported yet": the label
+ * shows and the bar is hidden, because a bar stuck at the left edge looks like
+ * a failure rather than a beginning. The label carries the byte figures too, so
+ * a user can see it moving even when the bar is only a few pixels along.
+ */
+- (void)refreshPrepareOverlay {
+    if (_forcePowerOffRequested) {
+        _prepareScrim.hidden = NO;
+        _prepareBar.hidden = YES;
+        _prepareLabel.text = _forcePoweringOff
+            ? @"Powering off machine…\nClosing the guest disk."
+            : @"Machine stopped.\nUse Back to retry clearing its resume point.";
+        return;
+    }
+    if (_shuttingDown) {
+        _prepareScrim.hidden = NO;
+        _prepareBar.hidden = YES;
+        _prepareLabel.text = @"Shutting down iPhone OS...\nNot responding? Use Back for Force Power Off.";
+        return;
+    }
+    if (_savingCheckpoint) {
+        _prepareScrim.hidden = NO;
+        _prepareBar.hidden = YES;
+        _prepareLabel.text = @"Saving machine...\nIt will resume here next time.";
+        return;
+    }
+    if (_restarting) {
+        _prepareScrim.hidden = NO;
+        _prepareBar.hidden = YES;
+        _prepareLabel.text =
+            @"Restarting iPhone OS...\nClosing the old machine safely.";
+        return;
+    }
+    BOOL preparing = [_engine isPreparingRootFilesystem];
+    _prepareScrim.hidden = !preparing;
+    if (!preparing) return;
+
+    double f = [_engine rootFilesystemProgress];
+    if (f < 0.0) {
+        _prepareBar.hidden = YES;
+        _prepareLabel.text =
+            @"Preparing iPhone OS\nCopying the root filesystem";
+        return;
+    }
+    if (f > 1.0) f = 1.0;
+    _prepareBar.hidden = NO;
+    _prepareBar.progress = (float)f;
+    _prepareLabel.text = [NSString stringWithFormat:
+        @"Preparing iPhone OS\nCopying filesystem: %.0f%%", f * 100.0];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (!_legacyInterface) { [self layoutModernInterface]; return; }
+
+    CGRect b = self.view.bounds;
+    UIEdgeInsets safe = self.view.safeAreaInsets;
+
+    // The run controls sit on the bottom edge, above the home indicator.
+    const CGFloat toolbarH = 44.0;
+    CGFloat toolbarY = b.size.height - safe.bottom - toolbarH;
+    if (toolbarY < 0.0) toolbarY = 0.0;
+    _toolbar.frame = CGRectMake(0.0, toolbarY, b.size.width, toolbarH);
+
+    const CGFloat top     = safe.top + 8.0;
+    const CGFloat keysH   = [VMButtonBar preferredHeight];
+    const CGFloat statsH  = 40.0;   /* three lines of 10pt: machine, touch, keys */
+    const CGFloat chrome  = 6.0 + keysH + 6.0 + statsH + 4.0;
+
+    /* The guest's screen gets ALL the space the fixed chrome does not need.
+     *
+     * It used to get 62% of it, with the guest's serial console taking the
+     * rest — so the first thing anyone saw was a wall of kernel logging under
+     * a small picture. The console moved to its own screen (VMConsole-
+     * ViewController, reachable from the toolbar in developer mode) and the
+     * picture grew into the space, which is the right split for a device whose
+     * entire point is the display.
+     *
+     * The fixed chrome still comes off the top of the calculation, so a
+     * cramped layout — a small phone, or landscape — shrinks the picture
+     * rather than pushing the buttons out through the bottom. */
+    CGFloat freeSpace = toolbarY - top - chrome;
+    if (freeSpace < 0.0) freeSpace = 0.0;
+
+    // Fit 320x480 inside the band without distortion. The layer's
+    // contentsGravity would do this anyway; doing it here too means the view's
+    // own aspect is already correct, so there is no interpretation of
+    // contentsScale that can stretch the image — and vm_touch_map() is then
+    // working against the same rectangle the picture is drawn in.
+    /* The picture takes everything unless the console is sharing the screen,
+     * in which case it takes the 62% it always did. */
+    BOOL inlineConsole = _sessionInlineConsole &&
+                         [[VMSettings sharedSettings] developerMode];
+    CGFloat band = inlineConsole ? floor(freeSpace * 0.62) : freeSpace;
+    if (band < 60.0) band = fmin(60.0, freeSpace);
+    CGFloat scale = fmin(b.size.width / (CGFloat)VM_FB_WIDTH,
+                         band / (CGFloat)VM_FB_HEIGHT);
+    CGFloat w = floor((CGFloat)VM_FB_WIDTH  * scale);
+    CGFloat h = floor((CGFloat)VM_FB_HEIGHT * scale);
+    _screen.frame = CGRectMake(floor((b.size.width - w) * 0.5),
+                               top + floor((band - h) * 0.5), w, h);
+
+    /* Exactly over the picture, so it reads as "this machine is busy" rather
+     * than as a modal covering the whole app. */
+    _prepareScrim.frame = _screen.frame;
+    CGFloat pw = floor(_screen.frame.size.width * 0.78);
+    CGFloat px = floor((_screen.frame.size.width - pw) * 0.5);
+    CGFloat pcy = floor(_screen.frame.size.height * 0.5);
+    _prepareLabel.frame = CGRectMake(px, pcy - 42.0, pw, 40.0);
+    _prepareBar.frame   = CGRectMake(px, pcy + 4.0,  pw, 4.0);
+
+    CGFloat y = top + band + 6.0;
+    _keys.frame = CGRectMake(0.0, y, b.size.width, keysH);
+    y += keysH + 6.0;
+
+    _stats.frame = CGRectMake(14.0, y, b.size.width - 28.0, statsH);
+    y += statsH + 4.0;
+
+    if (inlineConsole) {
+        CGFloat consoleH = toolbarY - y;
+        if (consoleH < 0.0) consoleH = 0.0;
+        _console.frame = CGRectMake(0.0, y, b.size.width, consoleH);
+        _console.hidden = NO;
+    } else {
+        _console.hidden = YES;
+    }
+}
+
+- (UIStatusBarStyle)preferredStatusBarStyle {
+    return _legacyInterface ? UIStatusBarStyleLightContent : UIStatusBarStyleDefault;
+}
+
+#pragma mark - Presentation
+
+- (void)tick:(CADisplayLink *)sender {
+    (void)sender;
+
+    /* Geometry comes back with the pixels rather than being assumed here. The
+     * emulator learns it from whichever CLCD window the guest enabled, and the
+     * guest is under no obligation to pick 320x480 — VMFramebufferView also
+     * measures touches against it, so an assumption here would be an
+     * assumption about where a finger landed. */
+    BOOL argb = NO;
+    uint32_t fbW = 0, fbH = 0, fbStride = 0;
+    if (_frame && [_engine copyFrameInto:_frame
+                                capacity:VM_FB_BYTES
+                                   width:&fbW
+                                  height:&fbH
+                                  stride:&fbStride
+                                    argb:&argb])
+        [_screen presentPixels:_frame
+                         width:fbW
+                        height:fbH
+                        stride:fbStride
+                          argb:argb];
+
+    [self appendConsole:[_engine takePendingConsoleText]];
+    [self flushConsole];
+
+    // Keep status work at its previous cadence, independent of pixel updates.
+    if ((++_ticks % 16) == 0) {
+        if (!_launchShutdownRequested && self.guestShutdownCompletion &&
+            [_engine isRunningFirmware] && [_engine isRunning] &&
+            !_forcePowerOffRequested && !_shuttingDown) {
+            _launchShutdownRequested = YES;
+            [self shutDownTapped:nil];
+        }
+        if (self.jailbreakNotice.length && self.view.window &&
+            self.navigationController.topViewController == self &&
+            UIApplication.sharedApplication.applicationState == UIApplicationStateActive &&
+            !self.transitionCoordinator && !self.presentedViewController && [self runtimeCanControlGuest]) {
+            NSString *message = self.jailbreakNotice;
+            self.jailbreakNotice = nil;
+            UIAlertController *notice = [UIAlertController alertControllerWithTitle:@"Jailbroken"
+                message:message preferredStyle:UIAlertControllerStyleAlert];
+            [notice addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            // The guest keeps booting behind the notice; OK only dismisses it.
+            [self presentViewController:notice animated:YES completion:nil];
+        }
+        if (self.openPackagesWhenRunning && self.view.window &&
+            self.navigationController.topViewController == self &&
+            !self.transitionCoordinator && !self.presentedViewController && [self runtimeCanControlGuest]) {
+            [self openRuntimePackages];
+            self.openPackagesWhenRunning = NO;
+        }
+        [self refreshStatusLine];
+        // A machine can stop on its own, so the toolbar has to keep asking.
+        [self refreshRunControls];
+        /*
+         * AND SO CAN A MACHINE BECOME READY. Preparing the root filesystem is
+         * the one thing this app does that finishes long after -start returned,
+         * on its own thread, ~450 MB later. Its result was written to
+         * -bringUpNote and read by nobody: the only reader was the one call
+         * below -start, so a user who was told "reopen this machine when it has
+         * finished" got no signal that it had -- or that it had failed. The
+         * console has it, and the console is developer-mode only.
+         *
+         * Compared against the last note SHOWN rather than against a flag, so
+         * this reports each distinct thing once and does not re-alert on the
+         * same sentence every sixteen frames.
+         */
+        [self refreshPrepareOverlay];
+
+        NSString *note = [_engine bringUpNote];
+        if (note.length && ![note isEqualToString:_lastBringUpNote]) {
+            _lastBringUpNote = note;
+            [self reportBringUpProblem:note];
+        }
+    }
+}
+
+/*
+ * Two lines. The first is the machine: whether it is paused, and then whatever
+ * VMEngine reports about the guest, its rate and this process's footprint. The
+ * second is input, which is permanently a statement that it does not work —
+ * once there is a touch to report, the coordinate that WOULD have been sent
+ * sits next to the reason it was not.
+ */
+- (void)refreshStatusLine {
+    /* One source for the machine's state: the engine. It reports "paused"
+     * itself now, so prefixing "paused" here as well would produce
+     * "paused · running", which is a contradiction rather than a status. */
+    NSString *machine = _engine ? ([_engine statusLine] ?: @"?") : @"no machine";
+
+    /* The touch path's own account of itself. "Delivered" here means the
+     * emulated controller ACCEPTED the report — not that the guest acted on
+     * it, which this app is in no position to know and will not claim. */
+    NSString *reason = _engine ? [_engine touchUnavailableReason]
+                               : @"no machine";
+    NSString *input;
+    if (reason.length == 0) {
+        uint64_t delivered = 0;
+        [_engine touchCountersQueued:NULL delivered:&delivered
+                           coalesced:NULL dropped:NULL];
+        input = _haveTouch
+            ? [NSString stringWithFormat:
+               @"touch %d,%d  ·  %llu accepted by the controller",
+               _touchX, _touchY, (unsigned long long)delivered]
+            : [NSString stringWithFormat:
+               @"touch  ·  %llu accepted by the controller",
+               (unsigned long long)delivered];
+    } else if (_haveTouch) {
+        input = [NSString stringWithFormat:
+                 @"touch %d,%d  ·  NOT delivered: %@", _touchX, _touchY, reason];
+    } else {
+        input = [NSString stringWithFormat:@"input  ·  NOT delivered: %@",
+                 reason];
+    }
+
+    /*
+     * The button path's own account of itself, which until now was computed
+     * and then never shown. A press that the board refuses looked exactly like
+     * a press that was never wired up: nothing happened and nothing was said.
+     *
+     * "delivered" means the emulated board TOOK the transition, not that the
+     * guest acted on it -- the same limit the touch line above states. The
+     * refusal count is the interesting number, because s5l_buttons_set()
+     * refuses for one specific, diagnosable reason: the guest has not armed
+     * that interrupt line, so AppleM68Buttons is not listening yet.
+     */
+    NSString *buttons;
+    if (_engine) {
+        NSString *why = [_engine buttonUnavailableReason];
+        uint64_t delivered = 0, refused = 0;
+        [_engine buttonCountersQueued:NULL delivered:&delivered
+                              refused:&refused dropped:NULL];
+        if (why.length)
+            buttons = [NSString stringWithFormat:
+                       @"keys   ·  NOT delivered: %@  (%llu refused)", why,
+                       (unsigned long long)refused];
+        else
+            buttons = [NSString stringWithFormat:
+                       @"keys   ·  %llu taken by the board, %llu refused",
+                       (unsigned long long)delivered,
+                       (unsigned long long)refused];
+    } else {
+        buttons = @"keys   ·  no machine";
+    }
+
+    _stats.text = [NSString stringWithFormat:@"%@\n%@\n%@",
+                   machine, input, buttons];
+}
+
+- (void)append:(NSString *)line {
+    [self appendConsole:[line stringByAppendingString:@"\n"]];
+    [self flushConsole];
+}
+
+/* Accumulate only. Pushing the string into the text view is -flushConsole's
+ * job, because doing it here would mean doing it from inside the self-tests
+ * before the view has been laid out, and thirty times a second afterwards. */
+- (void)appendConsole:(NSString *)text {
+    if (!text.length) return;
+
+    [_consoleText appendString:text];
+
+    if (_consoleText.length > kConsoleScrollback) {
+        NSUInteger excess = _consoleText.length - kConsoleScrollback;
+        /* Cut at a line boundary rather than mid-word: the top of the console
+         * is then a whole line of the guest's output instead of a fragment
+         * that reads as corruption. */
+        NSRange newline = [_consoleText rangeOfString:@"\n"
+                                              options:0
+                                                range:NSMakeRange(excess,
+                                                    _consoleText.length - excess)];
+        /* Only when something survives it. If the only newline left is the
+         * very last character, taking this boundary would delete the entire
+         * scrollback and blank the console — a worse outcome than the ragged
+         * first line the fallback leaves. */
+        if (newline.location != NSNotFound &&
+            newline.location + newline.length < _consoleText.length)
+            excess = newline.location + newline.length;
+        [_consoleText deleteCharactersInRange:NSMakeRange(0, excess)];
+    }
+    _consoleDirty = YES;
+}
+
+/*
+ * Replacing a UITextView's text destroys any selection in it, and the guest
+ * prints a line per frame forever, so a plain "assign every tick" console
+ * cannot be copied from: the selection is gone before a finger reaches Copy.
+ * So while something is selected, new output is held in _consoleText and shown
+ * when the selection is dropped. Scrollback is still bounded either way.
+ */
+- (void)flushConsole {
+    if (!_consoleDirty) return;
+    if (_console.selectedRange.length > 0) return;
+
+    // Only follow the tail if the user has not scrolled up to read something.
+    CGFloat slack = _console.contentSize.height - _console.contentOffset.y
+                  - _console.bounds.size.height;
+    BOOL followTail = (slack < 40.0);
+    CGPoint wasAt = _console.contentOffset;
+
+    _console.text = _consoleText;
+    _consoleDirty = NO;
+
+    if (followTail && _consoleText.length) {
+        [_console scrollRangeToVisible:NSMakeRange(_consoleText.length - 1, 1)];
+        return;
+    }
+
+    /* Assigning .text scrolls a UITextView back to the top, so without this
+     * the "let the user read" branch threw them to the start of a 12000
+     * character buffer on the next line of guest output — worse than not
+     * having the feature. Clamped because the scrollback may have been
+     * trimmed and the content is now shorter.
+     *
+     * This holds the OFFSET, not the text: a trim removes characters from the
+     * front, so a reader parked in a full buffer still sees the text drift up
+     * past them. Fixing that properly means measuring the removed text's
+     * height, which is not worth the machinery — a terminal scrolling its
+     * oldest lines away is behaviour people expect. */
+    CGFloat limit = _console.contentSize.height - _console.bounds.size.height;
+    if (limit < 0.0) limit = 0.0;
+    if (wasAt.y > limit) wasAt.y = limit;
+    _console.contentOffset = wasAt;
+}
+
+#pragma mark - Input (recorded and shown; never delivered)
+
+- (void)framebufferView:(VMFramebufferView *)view
+          touchAtGuestX:(int)x
+                 guestY:(int)y
+                  phase:(vm_touch_phase_t)phase {
+    (void)view;
+
+    _haveTouch = YES;
+    _touchX = x;
+    _touchY = y;
+
+    // Returns NO today, and the status line says so. Routed through the engine
+    // anyway so there is exactly one place that will start returning YES.
+    [_engine sendTouchAtGuestX:x y:y phase:phase];
+    [self refreshStatusLine];
+}
+
+- (void)buttonBar:(VMButtonBar *)bar
+  didChangeButton:(VMButton)button
+          pressed:(BOOL)pressed {
+    (void)bar;
+
+    /* Reachable now: +[VMEngine buttonUnavailableReason] returns nil, the bar
+     * enables every key, and this queues a transition the emulator thread hands
+     * to the board's five switches. A NO here means it was not even queued —
+     * the machine is not running, or the queue was full of edges that must not
+     * be coalesced away — and never that the guest ignored it. */
+    [_engine setButton:button pressed:pressed];
+    [self refreshStatusLine];
+}
+
+#pragma mark - Environment
+
+- (void)reportEnvironment {
+    struct utsname u; uname(&u);
+    [self append:[NSString stringWithFormat:@"device : %s", u.machine]];
+    [self append:[NSString stringWithFormat:@"os     : iOS %@",
+                  [[UIDevice currentDevice] systemVersion]]];
+
+    int flags = 0;
+    BOOL debugged = (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) == 0)
+                    && (flags & CS_DEBUGGED);
+    [self append:[NSString stringWithFormat:@"CS_DEBUGGED : %@", debugged ? @"YES" : @"no"]];
+
+    /* Requesting an RWX page is a useful capability hint on A9, but it is not
+     * proof that branching to unsigned memory is safe. Never execute probe
+     * code automatically during viewDidLoad: a jailbreak policy mismatch
+     * would turn every app launch into the same crash loop. The eventual JIT
+     * diagnostics screen can run an explicit, recoverable execution test. */
+    void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    BOOL rwx = (page != MAP_FAILED);
+    [self append:[NSString stringWithFormat:@"RWX mmap    : %@",
+                  rwx ? @"YES" : @"no"]];
+    /*
+     * Three states, not two. The previous form printed "capability preflight
+     * failed" whenever CS_DEBUGGED was clear, which on a STOCK phone is always
+     * -- so a device that mapped RWX successfully was reported the same way as
+     * one that could not map it at all. That is backwards: an RWX page on a
+     * stock iOS 26.1 iPhone17,2 is the interesting result, and it was being
+     * filed under "failed". Measured 2026-07-29 from a user's own run.
+     *
+     * What each state actually means:
+     *   no RWX          - the mapping was refused; no JIT without a different
+     *                     strategy entirely.
+     *   RWX, debugged   - both hints are green and an execution test can run.
+     *   RWX, not debugged - the MAPPING succeeded and executability is UNKNOWN.
+     *                     iOS may still enforce W^X at fault time, so a
+     *                     successful mmap is not permission to branch into it.
+     *                     This needs the explicit recoverable diagnostic the
+     *                     comment above describes, which does not exist yet.
+     */
+    NSString *jitState;
+    if (!rwx)          jitState = @"RWX refused -- no JIT on this device";
+    else if (debugged) jitState = @"RWX + CS_DEBUGGED; execution test can run";
+    else               jitState = @"RWX mapped, executability UNKNOWN "
+                                  @"(stock policy; mmap success is not proof)";
+    [self append:[NSString stringWithFormat:
+        @"JIT execute : not run at startup (%@)", jitState]];
+    if (rwx) munmap(page, 4096);
+
+    [self append:[NSString stringWithFormat:@"footprint   : %.1f MB at launch",
+                  [VMEngine physFootprintBytes] / 1048576.0]];
+}
+
+#pragma mark - Emulator self-tests
+
+// A bare-metal payload: load the UART base from a literal and print "HI\n".
+- (void)runUartDemo {
+    s5l8900_t m;
+    if (!s5l8900_init(&m, 0, 1u << 20)) { [self append:@"[soc] init failed"]; return; }
+
+    const uint32_t payload[] = {
+        0xe59f0018u,          // LDR r0,[pc,#24]
+        0xe3a01048u,          // MOV r1,#'H'
+        0xe5801020u,          // STR r1,[r0,#0x20]   UTXH
+        0xe3a01049u,          // MOV r1,#'I'
+        0xe5801020u,          // STR r1,[r0,#0x20]
+        0xe3a0100au,          // MOV r1,#'\n'
+        0xe5801020u,          // STR r1,[r0,#0x20]
+        0xeafffffeu,          // B .
+        S5L8900_UART0_BASE    // literal
+    };
+    s5l8900_load(&m, 0, payload, sizeof payload);
+    m.cpu.r[15] = 0;
+
+    arm_status_t st = ARM_OK;
+    unsigned n = s5l8900_run(&m, 32, &st);
+    m.uart0.tx[m.uart0.tx_len] = '\0';
+
+    [self append:[NSString stringWithFormat:@"[uart] guest said: %s", m.uart0.tx]];
+    [self append:[NSString stringWithFormat:@"[uart] %u instructions, status %d", n, (int)st]];
+    s5l8900_free(&m);
+}
+
+// Timer -> VIC -> CPU IRQ -> guest handler -> SUBS pc,lr,#4 back to the loop.
+- (void)runInterruptDemo {
+    s5l8900_t m;
+    if (!s5l8900_init(&m, 0, 1u << 20)) { [self append:@"[soc] init failed"]; return; }
+
+    const uint32_t branch = 0xea000000u | (((0x40u - 0x18u - 8u) / 4u) & 0x00ffffffu);
+    s5l8900_load(&m, 0x18, &branch, 4);          // IRQ vector -> 0x40
+
+    const uint32_t handler[] = {
+        0xe3a01054u,   // MOV r1,#'T'
+        0xe5801020u,   // STR r1,[r0,#0x20]
+        0xe3a01000u,   // MOV r1,#0
+        0xe58210a4u,   // STR r1,[r2,#0xa4]   stop timer 4
+        0xe3a01803u,   // MOV r1,#0x00030000
+        0xe58210f4u,   // STR r1,[r2,#0xf4]   acknowledge, as the kernel does
+        0xe25ef004u    // SUBS pc,lr,#4
+    };
+    s5l8900_load(&m, 0x40, handler, sizeof handler);
+
+    const uint32_t spin = 0xeafffffeu;
+    s5l8900_load(&m, 0x100, &spin, 4);
+
+    // This self-test exercises device -> controller -> CPU, not the clock
+    // ratio, so run the timebase at one tick per instruction to keep it quick.
+    m.cpu_hz = m.tb_hz = 1;
+
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << S5L8900_IRQ_TIMER);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_COUNTBUF, 4);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_STATE,
+                  TIMER4_STATE_START | TIMER4_STATE_UPDATE);
+
+    m.cpu.r[15] = 0x100;
+    m.cpu.r[0]  = S5L8900_UART0_BASE;
+    m.cpu.r[2]  = S5L8900_TIMER_BASE;
+    m.cpu.cpsr  = ARM_MODE_SYS;                  // IRQs unmasked
+
+    arm_status_t st = ARM_OK;
+    s5l8900_run(&m, 200, &st);
+    m.uart0.tx[m.uart0.tx_len] = '\0';
+
+    BOOL ok = (strcmp(m.uart0.tx, "T") == 0)
+              && ((m.cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS)
+              && (m.cpu.r[15] == 0x100);
+    [self append:[NSString stringWithFormat:@"[irq]  handler printed \"%s\", resumed pc=%08x  %@",
+                  m.uart0.tx, m.cpu.r[15], ok ? @"OK" : @"FAIL"]];
+    s5l8900_free(&m);
+}
+
+// Prove the MMU translates on-device: map one 1 MB section and walk it.
+- (void)runMmuDemo {
+    s5l8900_t m;
+    if (!s5l8900_init(&m, 0, 1u << 20)) { [self append:@"[soc] init failed"]; return; }
+
+    const uint32_t l1 = 0x4000;
+    uint32_t entry = (0x00200000u & 0xfff00000u) | (3u << 10) | 2u;   // section, AP=11
+    s5l8900_load(&m, l1 + ((0x80000000u >> 20) << 2), &entry, 4);
+    m.cpu.cp15.ttbr0 = l1;
+    m.cpu.cp15.dacr  = 1u;
+    m.cpu.cp15.sctlr |= ARM_SCTLR_M;
+
+    uint32_t pa = 0;
+    uint32_t fsr = arm_mmu_translate(&m.cpu, 0x80001234u, ARM_ACCESS_READ, true, &pa);
+    [self append:[NSString stringWithFormat:@"[mmu]  0x80001234 -> 0x%08x (fsr %u)  %@",
+                  pa, fsr, (fsr == 0 && pa == 0x00201234u) ? @"OK" : @"FAIL"]];
+    s5l8900_free(&m);
+}
+
+@end
