@@ -61,7 +61,7 @@ target_compile_definitions(s5lwinbox PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(s5lwinbox PRIVATE /W3 /utf-8)
+    target_compile_options(s5lwinbox PRIVATE /W3 /utf-8 /experimental:c11atomics)
 else()
     target_compile_options(s5lwinbox PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
