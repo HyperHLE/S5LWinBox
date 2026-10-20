@@ -10,7 +10,7 @@ on:
 jobs:
   build:
     name: Build & Package Windows x64
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Check out repository
@@ -30,7 +30,7 @@ jobs:
       - name: Configure CMake
         shell: cmd
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build S5LWinBox
         shell: cmd
@@ -43,13 +43,32 @@ jobs:
           New-Item -ItemType Directory -Path dist -Force
           New-Item -ItemType Directory -Path package -Force
           
-          Copy-Item build/Release/s5lwinbox.exe package/ -Force
-          Copy-Item build/Release/SDL2.dll package/ -Force -ErrorAction SilentlyContinue
-          Copy-Item rust/hyperhle-gles/target/release/hyperhle_gles.dll package/ -Force -ErrorAction SilentlyContinue
+          $exe = Get-ChildItem -Path build -Filter s5lwinbox.exe -Recurse | Select-Object -First 1
+          if ($exe) {
+            Write-Host "Found s5lwinbox.exe at $($exe.FullName)"
+            Copy-Item $exe.FullName package/ -Force
+          } else {
+            Write-Error "s5lwinbox.exe not found in build directory!"
+            exit 1
+          }
+          
+          $sdl = Get-ChildItem -Path build -Filter SDL2.dll -Recurse | Select-Object -First 1
+          if ($sdl) {
+            Write-Host "Found SDL2.dll at $($sdl.FullName)"
+            Copy-Item $sdl.FullName package/ -Force
+          }
+          
+          $gles = Get-ChildItem -Path rust/hyperhle-gles -Filter hyperhle_gles.dll -Recurse | Select-Object -First 1
+          if ($gles) {
+            Write-Host "Found hyperhle_gles.dll at $($gles.FullName)"
+            Copy-Item $gles.FullName package/ -Force
+          }
+          
           Copy-Item README.md package/ -Force -ErrorAction SilentlyContinue
           Copy-Item LICENSE package/ -Force -ErrorAction SilentlyContinue
           
           Compress-Archive -Path package/* -DestinationPath dist/S5LWinBox-windows-x64.zip -Force
+          Get-Item dist/S5LWinBox-windows-x64.zip | Format-List FullName, Length
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4

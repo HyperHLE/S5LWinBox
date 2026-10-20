@@ -58,7 +58,7 @@ unsafe fn create_handle(
     // support, shader setup) happens at creation time rather than on the
     // first guest call.
     {
-        let mut gl = context.make_current(&mut window);
+        let gl = context.make_current(&mut window);
         let description = unsafe { gl.driver_description() };
         log!("hyperhle-gles: created {} ({})", api_name(api), description);
     }
