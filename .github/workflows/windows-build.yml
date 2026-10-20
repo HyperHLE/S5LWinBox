@@ -28,8 +28,13 @@ jobs:
           cd ../..
 
       - name: Configure CMake
+        shell: powershell
         run: |
           cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build/CMakeFiles/CMakeError.log -ErrorAction SilentlyContinue | Select-Object -Last 100
+            exit 1
+          }
 
       - name: Build S5LWinBox
         run: |

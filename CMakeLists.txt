@@ -25,6 +25,15 @@ set(SDL_STATIC FALSE CACHE BOOL "Build static SDL library" FORCE)
 set(SDL_TEST FALSE CACHE BOOL "Disable SDL tests" FORCE)
 FetchContent_MakeAvailable(SDL2)
 
+# Determine SDL2 target name
+if(TARGET SDL2::SDL2)
+    set(S5L_SDL_TARGET SDL2::SDL2)
+elseif(TARGET SDL2)
+    set(S5L_SDL_TARGET SDL2)
+elseif(TARGET SDL2-static)
+    set(S5L_SDL_TARGET SDL2-static)
+endif()
+
 # Collect portable app sources (excluding VMFirmwareHLE.c which is already in host_vm_firmware_hle)
 file(GLOB S5L_APP_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/app/Sources/*.c")
 list(FILTER S5L_APP_SOURCES EXCLUDE REGEX "/VMFirmwareHLE\\.c$")
@@ -59,7 +68,7 @@ else()
 endif()
 
 target_link_libraries(s5lwinbox PRIVATE
-    SDL2::SDL2
+    ${S5L_SDL_TARGET}
     emucore
     nethost
     host_file_block
@@ -80,10 +89,10 @@ else()
 endif()
 
 # Copy SDL2.dll next to executable on Windows
-if(WIN32)
+if(WIN32 AND TARGET ${S5L_SDL_TARGET})
     add_custom_command(TARGET s5lwinbox POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE:${S5L_SDL_TARGET}>
             $<TARGET_FILE_DIR:s5lwinbox>
     )
 endif()

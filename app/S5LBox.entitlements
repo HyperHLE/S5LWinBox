@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Intentionally empty. S5LBox's shipping execution path is a no-JIT
+      interpreter and must run inside an ordinary stock-iOS app sandbox.
+
+      CI's ad-hoc signature is only a transport/build artifact and grants no
+      installability on stock iOS. A stock-device installer must replace it
+      with the user's ordinary Apple provisioning signature. Jailbreak-only
+      entitlements belong solely to standalone diagnostic executables, never
+      to this app target.
+    -->
+</dict>
+</plist>

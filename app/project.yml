@@ -1,0 +1,191 @@
+# XcodeGen spec for the S5LBox app.
+#
+# We do NOT commit an .xcodeproj (it is a churny binary blob). CI runs
+# `xcodegen generate` on the macOS runner to produce S5LBox.xcodeproj from
+# this file, then `xcodebuild`. To develop locally on a Mac, first run
+# `python3 ../tools/gen_a64_static.py Generated/a64_static_handlers.S`, then
+# `xcodegen generate`, and open the project.
+name: S5LBox
+options:
+  bundleIdPrefix: com.j0shua
+  deploymentTarget:
+    iOS: "13.0"
+  createIntermediateGroups: true
+
+targets:
+  S5LBox:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      # The app icon. A single 1024x1024 RGB image; Xcode derives every other
+      # size from it. It must have NO alpha channel -- the source art was RGBA
+      # and was composited onto black before being placed here, because iOS
+      # rejects an icon with transparency rather than flattening it for you.
+      - path: Assets.xcassets
+      - path: Resources/GuestPackages/s5lbox-package-service
+        buildPhase: resources
+      - path: Resources/GuestPackages/GuestPackageNotices.txt
+        buildPhase: resources
+      - path: Resources/GuestPackages/APSL-2.0.txt
+        buildPhase: resources
+      # Compile the platform-independent emulator core straight into the app.
+      - path: ../core/src
+        name: core
+        # The dynamic recompiler (docs/dynarec.md) is deliberately NOT in the
+        # app yet. It is gated by the CMake option S5LBOX_JIT for host builds
+        # and nothing in the machine's run loop calls it, so compiling it in
+        # would add code to the shipping binary that cannot run. Delete this
+        # exclusion at stage J3, when the app enables the JIT for real.
+        excludes:
+          - "jit/**"
+      # Ordinary build-time-signed AArch64 semantics. This is not a JIT: the
+      # generator emits normal text before Xcode compiles and signs the app,
+      # and no writable/executable page exists at runtime. CI creates this
+      # ignored file before XcodeGen resolves the source list.
+      - path: ../tools/a64_static.c
+        group: core
+      - path: Generated/a64_static_handlers.S
+        group: core
+      # The firmware importer authenticates what it produces against known-good
+      # SHA-256 digests, and the exact kernel and rootfs host policies already
+      # share this one implementation. Pulled in as a single file rather than as
+      # all of tools/, whose remaining files are desktop harness code that has
+      # no business in a phone binary.
+      - path: ../tools/sha256.c
+        group: core
+      # BOOTING APPLE'S KERNEL needs five more of those files, and no more.
+      # Each is portable C that already has a host test and is already built by
+      # core/CMakeLists.txt, so none of it is first compiled here:
+      #
+      #   ios3_bringup_gate.c  binds the gate below to core/src/boot/bringup.c
+      #   ios3_kernel_patch.c  the exact 7E18 identity gate and its five patch
+      #                        sites -- host POLICY, deliberately not in the
+      #                        portable core (see core/include/md_bridge.h)
+      #   guest_patch.c        the bounded, all-or-nothing patch transaction
+      #   file_block.c         the writable work image as a vm_block_t
+      #   rootfs_work.c        makes that work image from the imported rootfs
+      #
+      # They are listed one by one rather than as `path: ../tools` because the
+      # rest of that directory is desktop harness code -- bootkernel.c alone is
+      # 27,000 lines of diagnostics -- which has no business in a phone binary.
+      - path: ../tools/ios3_bringup_gate.c
+        group: core
+      # The normal build links the already-tested replacement library but does
+      # not arm it. A manual ios-build dispatch with experimental_hle=true adds
+      # S5LBOX_IOS3_HLE_EXPERIMENT, and only that candidate installs the exact-
+      # PC adapter in VMFirmwareBoot. Keeping one source graph makes the phone
+      # A/B differ by policy rather than by a hand-edited project.
+      - path: ../tools/ios3_hle.c
+        group: core
+      - path: ../tools/ios3_kernel_patch.c
+        group: core
+      - path: ../tools/guest_patch.c
+        group: core
+      - path: ../tools/file_block.c
+        group: core
+      - path: ../tools/rootfs_work.c
+        group: core
+      # Strict tar metadata parsing for the verified guest package foundation.
+      # Payload bytes remain download-only and are never part of the app.
+      - path: ../tools/payload_tar.c
+        group: core
+      # Ordinary nonblocking TCP/UDP sockets behind the portable guest NAT.
+      # No tunnel, raw socket, private API, entitlement, or background daemon.
+      - path: ../tools/net_host.c
+        group: core
+    # Linked explicitly rather than relying on module auto-linking: the display
+    # path calls into CoreGraphics (CGImageCreate) and QuartzCore (CALayer
+    # filters) directly, and "it happened to link via UIKit" is not something to
+    # discover on a CI runner.
+    dependencies:
+      - sdk: Foundation.framework
+      - sdk: Security.framework
+      - sdk: UIKit.framework
+      - sdk: QuickLook.framework
+      - sdk: CoreGraphics.framework
+      - sdk: ImageIO.framework
+      - sdk: QuartzCore.framework
+      - sdk: AVFoundation.framework
+      - sdk: libbz2.tbd
+      - sdk: libz.tbd
+    settings:
+      base:
+        PRODUCT_NAME: S5LBox
+        PRODUCT_BUNDLE_IDENTIFIER: com.j0shua.S5LBox
+        # The normal build shows S5LBox. The manual MBX workflow overrides this
+        # one setting to "S5LBox MBX" while retaining the stable product path
+        # used by packaging.
+        S5LBOX_DISPLAY_NAME: S5LBox
+        INFOPLIST_FILE: Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: S5LBox.entitlements
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../core/include
+          - $(SRCROOT)/../tools
+        GCC_C_LANGUAGE_STANDARD: c11
+        # THE APP WAS SHIPPING AT -Os, AND NOTHING HERE SAID SO.
+        #
+        # This file set no optimisation level at all, so the Release build
+        # inherited Xcode's default GCC_OPTIMIZATION_LEVEL = s. For an
+        # interpreter that is close to the worst available choice: -Os exists
+        # to suppress the inlining and unrolling that a hot dispatch loop is
+        # made of, and this app's entire workload is one such loop --
+        # arm_step() plus s5l8900_tick(), a hundred thousand times per chunk.
+        #
+        # The desktop harness has always been built -O2 or better by
+        # core/CMakeLists.txt, so every throughput number this project has
+        # published was measured on a build the phone was not getting.
+        GCC_OPTIMIZATION_LEVEL: 3
+        # s5l8900_run() calls arm_step() and s5l8900_tick() across translation
+        # units; without link-time optimisation neither can be inlined into the
+        # loop that calls them once per guest instruction.
+        LLVM_LTO: YES
+        # tools/file_block.c does 64-bit random access into a work image that
+        # may grow to 2 GiB. iOS's off_t is already 64-bit, so this is belt
+        # rather than braces -- but core/CMakeLists.txt sets it for the same
+        # file on every
+        # non-Windows host, and a build that differs from the tested one only
+        # in a width is the kind of difference that shows up as a silently
+        # truncated root filesystem.
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - $(inherited)
+          - _FILE_OFFSET_BITS=64
+          - S5LBOX_STATIC_A64_ENGINE=1
+          - S5LBOX_STATIC_A64_NATIVE=1
+          # Select the callback-free live-byte tier that passed balanced 10M
+          # and 100M full-guest A9 replays with byte-identical final state. Its
+          # sustained median was 17.708 versus 16.696 Minsn/s for adjacent
+          # interpreter controls (+6.06%). Unsupported or unproved shapes still
+          # fall back before mutation. The older decoded graph remains disabled:
+          # its exact canonical-bus A9 replay was a 6.17x regression.
+          - S5LBOX_STATIC_A64_DEFAULT_COMPACT_RAW=1
+          # Keep direct writes too: disabling this separate, guarded contract
+          # measured 4.14% slower with identical final evidence.
+          - S5LBOX_STATIC_A64_DEFAULT_DIRECT_WRITES=1
+          # Idle WFI previously skipped straight to each guest timer/display
+          # edge as fast as the phone could execute the host callback. That is
+          # correct for deterministic replay but wrong for an interactive app:
+          # guest time and auto-lock could run several times faster than wall
+          # time. Pace only autonomous idle intervals and yield every 8 ms;
+          # active CPU execution and generic core harnesses remain unthrottled.
+          - S5LBOX_IOS_WFI_REALTIME_PACING=1
+          # Use monotonic host time as an upper bound for active guest time,
+          # while the core's measured-safe retired-work budget prevents a slow
+          # phone from accumulating deadlines faster than XNU can service
+          # them. Paced WFI remains real-time. A machine-local diagnostic
+          # control can vary the work budget for same-binary calibration.
+          - S5LBOX_IOS_ACTIVE_REALTIME_CLOCK=1
+        # Stated rather than inherited: the Objective-C sources are written for
+        # ARC, and would leak (or double-free) under manual retain/release.
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_ENABLE_MODULES: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_BITCODE: NO
+        # Xcode produces an unsigned bundle. CI applies a stock-neutral ad-hoc
+        # signature with Apple's codesign only so the artifact is structurally
+        # complete; a stock-device installer replaces it with an ordinary
+        # provisioning signature. The app requests no private/JIT entitlement.
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
