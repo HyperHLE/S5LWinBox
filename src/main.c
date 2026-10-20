@@ -178,23 +178,19 @@ int main(int argc, char *argv[])
         GUEST_SCREEN_WIDTH, GUEST_SCREEN_HEIGHT
     );
 
-    /* Check if default machine exists or needs creation */
-    char machines_json[4096];
-    engine_machines_json(g_engine, machines_json, sizeof machines_json);
-    char current_machine[64] = "default";
-
-    /* Start default instance */
-    char start_err[256] = {0};
-    int start_rc = engine_start(g_engine, current_machine, start_err, sizeof start_err);
-    if (start_rc != 0) {
-        /* Attempt to auto-create default machine */
-        bool default_opts[16] = {false};
-        char new_id[64] = {0};
-        char create_err[256] = {0};
-        if (engine_machine_create(g_engine, "Default", default_opts, 0, 8, new_id, sizeof new_id, create_err, sizeof create_err) == 0) {
-            snprintf(current_machine, sizeof current_machine, "%s", new_id);
-            engine_start(g_engine, current_machine, start_err, sizeof start_err);
+    /* Resolve or create default machine */
+    char current_machine[64] = {0};
+    if (engine_get_or_create_default_machine(g_engine, current_machine, sizeof current_machine) == 0) {
+        printf("Selected machine ID: %s\n", current_machine);
+        char start_err[256] = {0};
+        int start_rc = engine_start(g_engine, current_machine, start_err, sizeof start_err);
+        if (start_rc == 0) {
+            printf("Engine started for machine: %s\n", current_machine);
+        } else {
+            printf("Engine start note: %s\n", start_err[0] ? start_err : "waiting for firmware");
         }
+    } else {
+        fprintf(stderr, "Failed to resolve or create machine\n");
     }
 
     uint32_t frame_buffer[GUEST_SCREEN_WIDTH * GUEST_SCREEN_HEIGHT];
@@ -233,10 +229,17 @@ int main(int argc, char *argv[])
                         int rc = engine_import_ipsw(g_engine, dropped_file, false, detail, sizeof detail);
                         printf("IPSW import %s: %s\n", rc == 0 ? "succeeded" : "failed", detail);
                         if (rc == 0) {
+                            if (!current_machine[0]) {
+                                engine_get_or_create_default_machine(g_engine, current_machine, sizeof current_machine);
+                            }
                             char start_err[256] = {0};
-                            engine_start(g_engine, current_machine, start_err, sizeof start_err);
+                            int s_rc = engine_start(g_engine, current_machine, start_err, sizeof start_err);
+                            printf("Engine start after IPSW import (%s): rc=%d %s\n", current_machine, s_rc, start_err);
                         }
                     } else if (flen > 4 && !_stricmp(dropped_file + flen - 4, ".ipa")) {
+                        if (!current_machine[0]) {
+                            engine_get_or_create_default_machine(g_engine, current_machine, sizeof current_machine);
+                        }
                         printf("Installing IPA: %s into %s\n", dropped_file, current_machine);
                         char cache_dir[512];
                         snprintf(cache_dir, sizeof cache_dir, "%s/cache", root_dir);
@@ -338,6 +341,15 @@ int main(int argc, char *argv[])
             }
         }
 
+        /* Drain engine console output to terminal stdout */
+        char console_buf[1024];
+        size_t c_drained = engine_console_drain(g_engine, console_buf, sizeof console_buf - 1);
+        if (c_drained > 0) {
+            console_buf[c_drained] = '\0';
+            fputs(console_buf, stdout);
+            fflush(stdout);
+        }
+
         /* Check for frame update */
         uint32_t fw = 0, fh = 0;
         if (engine_copy_frame(g_engine, frame_buffer, sizeof frame_buffer, &fw, &fh)) {
@@ -363,7 +375,16 @@ int main(int argc, char *argv[])
             const char *fps_ptr = strstr(status_json, "\"fps\":");
             const char *rate_ptr = strstr(status_json, "\"rate\":");
             const char *ready_ptr = strstr(status_json, "\"machineReady\":true");
-            if (ready_ptr) {
+            const char *prep_ptr = strstr(status_json, "\"preparing\":true");
+            const char *pdone_ptr = strstr(status_json, "\"prepareDone\":");
+            const char *ptot_ptr = strstr(status_json, "\"prepareTotal\":");
+
+            if (prep_ptr) {
+                uint64_t done = pdone_ptr ? strtoull(pdone_ptr + 14, NULL, 10) : 0;
+                uint64_t total = ptot_ptr ? strtoull(ptot_ptr + 15, NULL, 10) : 0;
+                unsigned pct = (total > 0) ? (unsigned)(done * 100ULL / total) : 0;
+                snprintf(title, sizeof title, "S5LWinBox — [Подготовка файловой системы: %u%%] | Inspector: http://localhost:%u", pct, log_port);
+            } else if (ready_ptr) {
                 double cur_fps = fps_ptr ? atof(fps_ptr + 6) : 0.0;
                 double cur_mips = rate_ptr ? atof(rate_ptr + 7) : 0.0;
                 snprintf(title, sizeof title, "S5LWinBox — [FPS: %.1f | MIPS: %.1f] | Inspector: http://localhost:%u", cur_fps, cur_mips, log_port);

@@ -38,6 +38,7 @@ int engine_firmware_json(engine_t *engine, char *out, size_t capacity);
 
 /* --------------------------------------------------------------- machines */
 int engine_machines_json(engine_t *engine, char *out, size_t capacity);
+int engine_get_or_create_default_machine(engine_t *engine, char *out_id, size_t capacity);
 int engine_machine_create(engine_t *engine, const char *name,
                           const bool *options, unsigned option_count,
                           unsigned disk_size_gib,

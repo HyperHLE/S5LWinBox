@@ -36,6 +36,15 @@ typedef SSIZE_T ssize_t;
 #define fsync(fd) _commit(fd)
 #define usleep(us) Sleep((DWORD)(((us) + 999) / 1000))
 
+static inline int s5l_rename_replace(const char *oldpath, const char *newpath) {
+    if (MoveFileExA(oldpath, newpath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return 0;
+    }
+    _unlink(newpath);
+    return (rename)(oldpath, newpath);
+}
+#define rename s5l_rename_replace
+
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif

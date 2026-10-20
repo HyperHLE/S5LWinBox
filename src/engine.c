@@ -871,7 +871,10 @@ static bool persist_instances_locked(engine_t *e)
         close(fd);
     }
     free(text);
-    if (ok && rename(tmp, path) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) {
+        unlink(path);
+        if (rename(tmp, path) != 0) ok = false;
+    }
     if (!ok) unlink(tmp);
     return ok;
 }
@@ -1608,6 +1611,31 @@ int engine_machine_create(engine_t *engine, const char *name,
         }
     }
     if (new_id && id_capacity) snprintf(new_id, id_capacity, "%s", id);
+    return 0;
+}
+
+int engine_get_or_create_default_machine(engine_t *engine, char *out_id, size_t capacity)
+{
+    engine_t *e = engine;
+    if (!e || !out_id || capacity == 0) return -1;
+    out_id[0] = '\0';
+
+    pthread_mutex_lock(&e->lock);
+    if (e->instances.count > 0) {
+        snprintf(out_id, capacity, "%s", e->instances.slot[0].id);
+        pthread_mutex_unlock(&e->lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&e->lock);
+
+    bool default_opts[VM_INSTANCE_OPTION_MAX] = {false};
+    char detail[256] = {0};
+    int rc = engine_machine_create(e, "iPhone 3G", default_opts, 0, 8,
+                                   out_id, capacity, detail, sizeof detail);
+    if (rc != 0) {
+        ENGINE_WARN("Failed to create default machine: %s", detail);
+        return -1;
+    }
     return 0;
 }
 
