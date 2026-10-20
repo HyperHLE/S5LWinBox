@@ -223,14 +223,24 @@ int main(int argc, char *argv[])
                     char detail[512] = {0};
                     if (flen > 5 && !_stricmp(dropped_file + flen - 5, ".ipsw")) {
                         printf("Importing IPSW: %s\n", dropped_file);
+                        engine_stop(g_engine, ENGINE_STOP_PLAIN);
                         int rc = engine_import_ipsw(g_engine, dropped_file, false, detail, sizeof detail);
                         printf("IPSW import %s: %s\n", rc == 0 ? "succeeded" : "failed", detail);
+                        if (rc == 0) {
+                            char start_err[256] = {0};
+                            engine_start(g_engine, current_machine, start_err, sizeof start_err);
+                        }
                     } else if (flen > 4 && !_stricmp(dropped_file + flen - 4, ".ipa")) {
                         printf("Installing IPA: %s into %s\n", dropped_file, current_machine);
                         char cache_dir[512];
                         snprintf(cache_dir, sizeof cache_dir, "%s/cache", root_dir);
+                        engine_stop(g_engine, ENGINE_STOP_PLAIN);
                         int rc = engine_machine_install_ipa(g_engine, current_machine, cache_dir, dropped_file, detail, sizeof detail);
                         printf("IPA install %s: %s\n", rc == 0 ? "succeeded" : "failed", detail);
+                        if (rc == 0) {
+                            char start_err[256] = {0};
+                            engine_start(g_engine, current_machine, start_err, sizeof start_err);
+                        }
                     }
                     SDL_free(dropped_file);
                 }

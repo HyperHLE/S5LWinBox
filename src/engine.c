@@ -221,15 +221,20 @@ static bool mkdir_p(const char *path)
     if (len >= sizeof tmp) return false;
     memcpy(tmp, path, len + 1u);
     for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/') continue;
+        if (*p != '/' && *p != '\\') continue;
+        if (p == tmp + 2 && tmp[1] == ':') continue; /* Skip C:\ drive root */
+        char sep = *p;
         *p = '\0';
         if (mkdir(tmp, 0770) != 0 && errno != EEXIST) {
-            *p = '/';
-            return false;
+            *p = sep;
+            if (!is_directory(tmp)) return false;
+        } else {
+            *p = sep;
         }
-        *p = '/';
     }
-    if (mkdir(tmp, 0770) != 0 && errno != EEXIST) return false;
+    if (mkdir(tmp, 0770) != 0 && errno != EEXIST) {
+        if (!is_directory(tmp)) return false;
+    }
     return is_directory(tmp);
 }
 
@@ -997,9 +1002,9 @@ static bool import_cancel_cb(void *context)
     return atomic_load(&e->import_cancel);
 }
 
-int engine_import_ipsw(engine_t *engine, int fd, uint64_t size,
-                       bool skip_stock_checksums,
-                       char *detail, size_t detail_capacity)
+static int engine_import_ipsw_fd(engine_t *engine, int fd, uint64_t size,
+                               bool skip_stock_checksums,
+                               char *detail, size_t detail_capacity)
 {
     engine_t *e = engine;
     import_pread_ctx_t source;
@@ -1084,6 +1089,38 @@ int engine_import_ipsw(engine_t *engine, int fd, uint64_t size,
                    prepared ? "complete" : "failed",
                    report.detail[0] ? report.detail : vm_fw_strerror(status));
     return prepared ? 0 : -1;
+}
+
+int engine_import_ipsw(engine_t *engine, const char *ipsw_path,
+                       bool skip_stock_checksums,
+                       char *detail, size_t detail_capacity)
+{
+    if (detail && detail_capacity) detail[0] = '\0';
+    if (!engine || !ipsw_path || !ipsw_path[0]) {
+        if (detail && detail_capacity)
+            snprintf(detail, detail_capacity, "No IPSW path specified.");
+        return -1;
+    }
+    struct stat st;
+    if (stat(ipsw_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        if (detail && detail_capacity)
+            snprintf(detail, detail_capacity, "IPSW file '%s' not found or empty.", ipsw_path);
+        return -1;
+    }
+#if defined(_O_BINARY)
+    int flags = O_RDONLY | _O_BINARY | O_CLOEXEC;
+#else
+    int flags = O_RDONLY | O_CLOEXEC;
+#endif
+    int fd = open(ipsw_path, flags);
+    if (fd < 0) {
+        if (detail && detail_capacity)
+            snprintf(detail, detail_capacity, "Cannot open IPSW file '%s' (errno %d).", ipsw_path, errno);
+        return -1;
+    }
+    int rc = engine_import_ipsw_fd(engine, fd, (uint64_t)st.st_size, skip_stock_checksums, detail, detail_capacity);
+    close(fd);
+    return rc;
 }
 
 void engine_import_cancel(engine_t *engine)
