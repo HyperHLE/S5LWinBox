@@ -93,6 +93,9 @@ static void get_default_data_dir(char *out, size_t cap)
 
 int main(int argc, char *argv[])
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     char root_dir[512];
     get_default_data_dir(root_dir, sizeof root_dir);
 
@@ -196,6 +199,9 @@ int main(int argc, char *argv[])
 
     uint32_t frame_buffer[GUEST_SCREEN_WIDTH * GUEST_SCREEN_HEIGHT];
     memset(frame_buffer, 0, sizeof frame_buffer);
+
+    printf("\n>>> Drag and drop an iPhone OS 3.1.3 IPSW file into this window to start! <<<\n");
+    printf("Hotkeys: Esc=Home, F1=Power, F2/F3=Vol-/+, F5=Mute, F11=Fullscreen, Space=Pause\n\n");
 
     bool running = true;
     bool fullscreen = false;
@@ -346,15 +352,24 @@ int main(int argc, char *argv[])
         SDL_RenderCopy(renderer, texture, NULL, &vp);
         SDL_RenderPresent(renderer);
 
-        /* Status update once per second */
+        /* Status update twice per second */
         uint32_t now = SDL_GetTicks();
-        if (now - last_title_update >= 1000) {
+        if (now - last_title_update >= 500) {
             last_title_update = now;
             char status_json[512] = {0};
             engine_status_json(g_engine, status_json, sizeof status_json);
 
-            char title[256];
-            snprintf(title, sizeof title, "S5LWinBox — iPhone OS 3 | Inspector: http://localhost:%u", log_port);
+            char title[384];
+            const char *fps_ptr = strstr(status_json, "\"fps\":");
+            const char *rate_ptr = strstr(status_json, "\"rate\":");
+            const char *ready_ptr = strstr(status_json, "\"machineReady\":true");
+            if (ready_ptr) {
+                double cur_fps = fps_ptr ? atof(fps_ptr + 6) : 0.0;
+                double cur_mips = rate_ptr ? atof(rate_ptr + 7) : 0.0;
+                snprintf(title, sizeof title, "S5LWinBox — [FPS: %.1f | MIPS: %.1f] | Inspector: http://localhost:%u", cur_fps, cur_mips, log_port);
+            } else {
+                snprintf(title, sizeof title, "S5LWinBox — [Ожидание IPSW: перетащите .ipsw в окно] | Inspector: http://localhost:%u", log_port);
+            }
             SDL_SetWindowTitle(window, title);
         }
 
