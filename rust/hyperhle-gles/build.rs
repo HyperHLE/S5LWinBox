@@ -28,7 +28,7 @@ fn main() {
     );
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "android" || std::env::var_os("HYPERHLE_FORCE_PVRTC_BUILD").is_some() {
+    if target_os == "android" || target_os == "windows" || std::env::var_os("HYPERHLE_FORCE_PVRTC_BUILD").is_some() {
         let mut build = cc::Build::new();
         build
             .cpp(true)

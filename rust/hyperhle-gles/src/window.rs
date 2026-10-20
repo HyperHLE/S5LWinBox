@@ -51,7 +51,8 @@ const EGL_CONTEXT_CLIENT_VERSION: EGLint = 0x3098;
 const EGL_WIDTH: EGLint = 0x3057;
 const EGL_HEIGHT: EGLint = 0x3056;
 
-#[cfg_attr(target_os = "android", link(name = "EGL"))]
+#[cfg(target_os = "android")]
+#[link(name = "EGL")]
 extern "C" {
     fn eglGetDisplay(display_id: EGLNativeDisplayType) -> EGLDisplay;
     fn eglInitialize(dpy: EGLDisplay, major: *mut EGLint, minor: *mut EGLint) -> EGLBoolean;
@@ -94,6 +95,145 @@ extern "C" {
     fn eglGetError() -> EGLint;
     fn eglTerminate(dpy: EGLDisplay) -> EGLBoolean;
 }
+
+#[cfg(not(target_os = "android"))]
+mod dyn_egl {
+    use super::*;
+    use std::sync::OnceLock;
+
+    type FnGetDisplay = unsafe extern "C" fn(EGLNativeDisplayType) -> EGLDisplay;
+    type FnInitialize = unsafe extern "C" fn(EGLDisplay, *mut EGLint, *mut EGLint) -> EGLBoolean;
+    type FnBindAPI = unsafe extern "C" fn(EGLenum) -> EGLBoolean;
+    type FnChooseConfig = unsafe extern "C" fn(EGLDisplay, *const EGLint, *mut EGLConfig, EGLint, *mut EGLint) -> EGLBoolean;
+    type FnCreateContext = unsafe extern "C" fn(EGLDisplay, EGLConfig, EGLContext, *const EGLint) -> EGLContext;
+    type FnCreateWindowSurface = unsafe extern "C" fn(EGLDisplay, EGLConfig, EGLNativeWindowType, *const EGLint) -> EGLSurface;
+    type FnCreatePbufferSurface = unsafe extern "C" fn(EGLDisplay, EGLConfig, *const EGLint) -> EGLSurface;
+    type FnDestroySurface = unsafe extern "C" fn(EGLDisplay, EGLSurface) -> EGLBoolean;
+    type FnDestroyContext = unsafe extern "C" fn(EGLDisplay, EGLContext) -> EGLBoolean;
+    type FnMakeCurrent = unsafe extern "C" fn(EGLDisplay, EGLSurface, EGLSurface, EGLContext) -> EGLBoolean;
+    type FnGetCurrentContext = unsafe extern "C" fn() -> EGLContext;
+    type FnSwapBuffers = unsafe extern "C" fn(EGLDisplay, EGLSurface) -> EGLBoolean;
+    type FnGetProcAddress = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type FnGetError = unsafe extern "C" fn() -> EGLint;
+    type FnTerminate = unsafe extern "C" fn(EGLDisplay) -> EGLBoolean;
+
+    pub struct EglLib {
+        pub get_display: FnGetDisplay,
+        pub initialize: FnInitialize,
+        pub bind_api: FnBindAPI,
+        pub choose_config: FnChooseConfig,
+        pub create_context: FnCreateContext,
+        pub create_window_surface: FnCreateWindowSurface,
+        pub create_pbuffer_surface: FnCreatePbufferSurface,
+        pub destroy_surface: FnDestroySurface,
+        pub destroy_context: FnDestroyContext,
+        pub make_current: FnMakeCurrent,
+        pub get_current_context: FnGetCurrentContext,
+        pub swap_buffers: FnSwapBuffers,
+        pub get_proc_address: FnGetProcAddress,
+        pub get_error: FnGetError,
+        pub terminate: FnTerminate,
+    }
+
+    #[cfg(target_os = "windows")]
+    extern "system" {
+        fn LoadLibraryA(lpLibFileName: *const c_char) -> *mut c_void;
+        fn GetProcAddress(hModule: *mut c_void, lpProcName: *const c_char) -> *mut c_void;
+    }
+
+    pub fn get_egl() -> Option<&'static EglLib> {
+        static EGL: OnceLock<Option<EglLib>> = OnceLock::new();
+        EGL.get_or_init(|| {
+            #[cfg(target_os = "windows")]
+            unsafe {
+                let mod_name = b"libEGL.dll\0";
+                let mut h = LoadLibraryA(mod_name.as_ptr() as _);
+                if h.is_null() {
+                    let fallback = b"EGL.dll\0";
+                    h = LoadLibraryA(fallback.as_ptr() as _);
+                }
+                if h.is_null() {
+                    return None;
+                }
+                macro_rules! sym {
+                    ($name:literal, $t:ty) => {{
+                        let p = GetProcAddress(h, concat!($name, "\0").as_ptr() as _);
+                        if p.is_null() { return None; }
+                        std::mem::transmute::<*mut c_void, $t>(p)
+                    }};
+                }
+                Some(EglLib {
+                    get_display: sym!("eglGetDisplay", FnGetDisplay),
+                    initialize: sym!("eglInitialize", FnInitialize),
+                    bind_api: sym!("eglBindAPI", FnBindAPI),
+                    choose_config: sym!("eglChooseConfig", FnChooseConfig),
+                    create_context: sym!("eglCreateContext", FnCreateContext),
+                    create_window_surface: sym!("eglCreateWindowSurface", FnCreateWindowSurface),
+                    create_pbuffer_surface: sym!("eglCreatePbufferSurface", FnCreatePbufferSurface),
+                    destroy_surface: sym!("eglDestroySurface", FnDestroySurface),
+                    destroy_context: sym!("eglDestroyContext", FnDestroyContext),
+                    make_current: sym!("eglMakeCurrent", FnMakeCurrent),
+                    get_current_context: sym!("eglGetCurrentContext", FnGetCurrentContext),
+                    swap_buffers: sym!("eglSwapBuffers", FnSwapBuffers),
+                    get_proc_address: sym!("eglGetProcAddress", FnGetProcAddress),
+                    get_error: sym!("eglGetError", FnGetError),
+                    terminate: sym!("eglTerminate", FnTerminate),
+                })
+            }
+            #[cfg(not(target_os = "windows"))]
+            None
+        }).as_ref()
+    }
+
+    pub unsafe fn eglGetDisplay(display_id: EGLNativeDisplayType) -> EGLDisplay {
+        get_egl().map_or(EGL_NO_DISPLAY, |e| (e.get_display)(display_id))
+    }
+    pub unsafe fn eglInitialize(dpy: EGLDisplay, major: *mut EGLint, minor: *mut EGLint) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.initialize)(dpy, major, minor))
+    }
+    pub unsafe fn eglBindAPI(api: EGLenum) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.bind_api)(api))
+    }
+    pub unsafe fn eglChooseConfig(dpy: EGLDisplay, attrib_list: *const EGLint, configs: *mut EGLConfig, config_size: EGLint, num_config: *mut EGLint) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.choose_config)(dpy, attrib_list, configs, config_size, num_config))
+    }
+    pub unsafe fn eglCreateContext(dpy: EGLDisplay, config: EGLConfig, share_context: EGLContext, attrib_list: *const EGLint) -> EGLContext {
+        get_egl().map_or(EGL_NO_CONTEXT, |e| (e.create_context)(dpy, config, share_context, attrib_list))
+    }
+    pub unsafe fn eglCreateWindowSurface(dpy: EGLDisplay, config: EGLConfig, win: EGLNativeWindowType, attrib_list: *const EGLint) -> EGLSurface {
+        get_egl().map_or(EGL_NO_SURFACE, |e| (e.create_window_surface)(dpy, config, win, attrib_list))
+    }
+    pub unsafe fn eglCreatePbufferSurface(dpy: EGLDisplay, config: EGLConfig, attrib_list: *const EGLint) -> EGLSurface {
+        get_egl().map_or(EGL_NO_SURFACE, |e| (e.create_pbuffer_surface)(dpy, config, attrib_list))
+    }
+    pub unsafe fn eglDestroySurface(dpy: EGLDisplay, surface: EGLSurface) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.destroy_surface)(dpy, surface))
+    }
+    pub unsafe fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.destroy_context)(dpy, ctx))
+    }
+    pub unsafe fn eglMakeCurrent(dpy: EGLDisplay, draw: EGLSurface, read: EGLSurface, ctx: EGLContext) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.make_current)(dpy, draw, read, ctx))
+    }
+    pub unsafe fn eglGetCurrentContext() -> EGLContext {
+        get_egl().map_or(EGL_NO_CONTEXT, |e| (e.get_current_context)())
+    }
+    pub unsafe fn eglSwapBuffers(dpy: EGLDisplay, surface: EGLSurface) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.swap_buffers)(dpy, surface))
+    }
+    pub unsafe fn eglGetProcAddress(procname: *const c_char) -> *mut c_void {
+        get_egl().map_or(ptr::null_mut(), |e| (e.get_proc_address)(procname))
+    }
+    pub unsafe fn eglGetError() -> EGLint {
+        get_egl().map_or(0, |e| (e.get_error)())
+    }
+    pub unsafe fn eglTerminate(dpy: EGLDisplay) -> EGLBoolean {
+        get_egl().map_or(EGL_FALSE, |e| (e.terminate)(dpy))
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+use dyn_egl::*;
 
 /// Same shape as touchHLE's `GLVersion`; only the GLES variants can be
 /// created through EGL on Android.
