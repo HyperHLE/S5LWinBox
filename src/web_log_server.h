@@ -30,8 +30,12 @@ void web_log_post_raw(const char *category, const char *data, size_t len);
 void web_log_flush_raw(void);
 
 /* Formatted log post. */
+#if defined(__GNUC__) || defined(__clang__)
 void web_log_printf(const char *category, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
+#else
+void web_log_printf(const char *category, const char *fmt, ...);
+#endif
 
 /* Update emulator status for the /api/status endpoint. */
 void web_log_set_status(uint64_t retired, double fps, double mips,

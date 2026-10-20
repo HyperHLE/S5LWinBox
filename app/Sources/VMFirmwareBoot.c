@@ -19,6 +19,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #if defined(S5LBOX_IOS_WFI_REALTIME_PACING)
 #include <errno.h>
 #endif
@@ -79,6 +85,12 @@ static bool vm_firmware_guest_restart(void *opaque);
  */
 static bool vm_firmware_wfi_sleep(void *ctx, uint64_t nanoseconds) {
     (void)ctx;
+#ifdef _WIN32
+    DWORD ms = (DWORD)(nanoseconds / UINT64_C(1000000));
+    if (ms == 0 && nanoseconds > 0) ms = 1;
+    Sleep(ms);
+    return true;
+#else
     struct timespec request;
     request.tv_sec = (time_t)(nanoseconds / UINT64_C(1000000000));
     request.tv_nsec = (long)(nanoseconds % UINT64_C(1000000000));
@@ -89,6 +101,7 @@ static bool vm_firmware_wfi_sleep(void *ctx, uint64_t nanoseconds) {
         if (errno != EINTR) return false;
         request = remaining;
     }
+#endif
 }
 #endif
 
@@ -102,6 +115,20 @@ static bool vm_firmware_active_now(void *ctx, uint64_t *nanoseconds) {
     (void)ctx;
     if (!nanoseconds) return false;
 
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    static int initialized = 0;
+    if (!initialized) {
+        if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0) return false;
+        initialized = 1;
+    }
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceCounter(&counter)) return false;
+    uint64_t sec = (uint64_t)(counter.QuadPart / freq.QuadPart);
+    uint64_t rem = (uint64_t)(counter.QuadPart % freq.QuadPart);
+    *nanoseconds = sec * UINT64_C(1000000000) + (rem * UINT64_C(1000000000)) / (uint64_t)freq.QuadPart;
+    return true;
+#else
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
         now.tv_sec < 0 || now.tv_nsec < 0 ||
@@ -114,6 +141,7 @@ static bool vm_firmware_active_now(void *ctx, uint64_t *nanoseconds) {
         return false;
     *nanoseconds = seconds * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
     return true;
+#endif
 }
 #endif
 
