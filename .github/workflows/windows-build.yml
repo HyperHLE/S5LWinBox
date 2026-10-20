@@ -32,9 +32,21 @@ jobs:
         run: |
           cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object -FilePath cmake_config.log
           if ($LASTEXITCODE -ne 0) {
-            Get-Content cmake_config.log | Select-Object -Last 50
+            Write-Host "=== CMAKE CONFIGURATION FAILED ==="
+            Get-Content cmake_config.log
             exit 1
           }
+
+      - name: Upload Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-config-logs
+          path: |
+            cmake_config.log
+            build/CMakeFiles/CMakeError.log
+            build/CMakeFiles/CMakeOutput.log
+          retention-days: 7
 
       - name: Build S5LWinBox
         run: |

@@ -17,8 +17,7 @@ add_subdirectory(core)
 include(FetchContent)
 FetchContent_Declare(
     SDL2
-    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-    GIT_TAG release-2.28.5
+    URL https://github.com/libsdl-org/SDL/releases/download/release-2.28.5/SDL2-2.28.5.zip
 )
 set(SDL_SHARED TRUE CACHE BOOL "Build shared SDL library" FORCE)
 set(SDL_STATIC FALSE CACHE BOOL "Build static SDL library" FORCE)
