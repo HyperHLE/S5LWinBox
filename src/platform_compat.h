@@ -22,10 +22,23 @@
 #include <direct.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <BaseTsd.h>
+
+#if !defined(_SSIZE_T_DEFINED) && !defined(ssize_t)
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
 
 #define mkdir(path, mode) _mkdir(path)
 #define strdup _strdup
 #define fileno _fileno
+#define unlink _unlink
+#define fsync(fd) _commit(fd)
+#define usleep(us) Sleep((DWORD)(((us) + 999) / 1000))
+
+#ifndef PATH_MAX
+#define PATH_MAX 1024
+#endif
 
 #ifndef O_CLOEXEC
 #if defined(_O_NOINHERIT)
