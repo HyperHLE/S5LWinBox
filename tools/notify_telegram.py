@@ -159,12 +159,24 @@ def main():
                 print(f"[telegram] Sending {zf} ({size_mb:.1f} MB)...")
                 send_telegram_document(token, chat_id, thread_id, zf, caption)
     else:
+        cmake_err = ""
+        for log_candidate in ["cmake_config.log", "build/CMakeFiles/CMakeError.log", "build/CMakeFiles/CMakeOutput.log"]:
+            if os.path.isfile(log_candidate):
+                try:
+                    with open(log_candidate, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [l.strip() for l in f.readlines() if l.strip()]
+                        if lines:
+                            cmake_err += f"\n--- {log_candidate} ---\n" + "\n".join(lines[-15:])
+                except Exception:
+                    pass
+        err_box = f"\n\n<b>CMake / Build Log:</b>\n<pre>{html.escape(cmake_err[-1200:])}</pre>" if cmake_err else ""
         text = (
             "❌ <b>Ошибка при сборке S5LWinBox!</b>\n\n"
             f"🌿 <b>Ветка:</b> <code>{html.escape(branch)}</code>\n"
             f'📌 <b>Коммит:</b> <a href="{commit_url}">{short_sha}</a> — <i>{first_line_esc}</i>\n'
             f"👤 <b>Автор:</b> {html.escape(actor)}\n"
             f'🔗 <b>Логи ошибки:</b> <a href="{run_url}">GitHub Actions #{html.escape(str(run_number))}</a>'
+            f"{err_box}"
         )
         send_telegram_message(token, chat_id, thread_id, text)
 

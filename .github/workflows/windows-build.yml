@@ -30,9 +30,9 @@ jobs:
       - name: Configure CMake
         shell: powershell
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object -FilePath cmake_config.log
           if ($LASTEXITCODE -ne 0) {
-            Get-Content build/CMakeFiles/CMakeError.log -ErrorAction SilentlyContinue | Select-Object -Last 100
+            Get-Content cmake_config.log | Select-Object -Last 50
             exit 1
           }
 
