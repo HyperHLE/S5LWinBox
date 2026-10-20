@@ -13,6 +13,9 @@
 #include "web_log_server.h"
 #include "VMButtonQueue.h"
 
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +107,7 @@ int main(int argc, char *argv[])
     printf(" Storage Root: %s\n", root_dir);
     printf("====================================================\n");
 
+    SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS | SDL_INIT_TIMER) != 0) {
         fprintf(stderr, "Failed to initialize SDL2: %s\n", SDL_GetError());
         return 1;
