@@ -4485,7 +4485,9 @@ typedef struct {
     s5l_restart_host_service_fn restart_host_service;
     void                       *restart_host_ctx;
 
-    /* Pluggable JIT backend (e.g. Dynarmic A32) */
+    /* Host-only JIT backend and instruction counter. snap_mach() deliberately
+     * excludes these fields so a snapshot restore retains live host state and
+     * the on-disk snapshot format remains unchanged. */
     void                       *jit;
     const struct s5l_jit_ops   *jit_ops;
     uint64_t                    jit_retired;
