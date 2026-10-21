@@ -103,6 +103,8 @@ if(WIN32)
         add_custom_command(TARGET s5lwinbox POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_SOURCE_DIR}/tools/angle/libEGL.dll"
+                $<TARGET_FILE_DIR:s5lwinbox>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_SOURCE_DIR}/tools/angle/libGLESv2.dll"
                 $<TARGET_FILE_DIR:s5lwinbox>
         )

@@ -3222,9 +3222,6 @@ bool engine_is_display_running(engine_t *engine)
     if (!engine) return false;
     pthread_mutex_lock(&engine->lock);
     bool running = engine->have_frame && !engine->snapshot_blank;
-    if (engine->machine) {
-        running = s5l_clcd_running(&engine->machine->clcd);
-    }
     pthread_mutex_unlock(&engine->lock);
     return running;
 }
