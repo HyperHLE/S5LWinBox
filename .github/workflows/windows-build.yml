@@ -2,9 +2,9 @@ name: Build S5LWinBox (Windows x64)
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "jit*" ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "jit*" ]
   workflow_dispatch:
 
 jobs:
@@ -30,6 +30,10 @@ jobs:
       - name: Configure CMake
         shell: cmd
         run: |
+          if defined BOOST_ROOT_1_83_0 set BOOST_ROOT=%BOOST_ROOT_1_83_0%
+          if defined BOOST_ROOT_1_84_0 set BOOST_ROOT=%BOOST_ROOT_1_84_0%
+          if defined BOOST_ROOT_1_85_0 set BOOST_ROOT=%BOOST_ROOT_1_85_0%
+          if defined BOOST_ROOT_1_86_0 set BOOST_ROOT=%BOOST_ROOT_1_86_0%
           cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build S5LWinBox

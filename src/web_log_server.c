@@ -9,7 +9,9 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <time.h>
+#if defined(_WIN32)
 #include "platform_compat.h"
+#endif
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
