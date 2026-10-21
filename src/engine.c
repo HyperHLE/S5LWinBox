@@ -2570,7 +2570,6 @@ static void engine_thread_main(engine_t *e)
     uint64_t pause_started_ns = 0;
     bool audio_running = false;
 #if defined(__linux__)
-    bool startup_display_seen = false;
     bool startup_wake_sent = false;
 #endif
 
@@ -2701,9 +2700,7 @@ static void engine_thread_main(engine_t *e)
 
         retired += s5l8900_run(machine, ENGINE_CHUNK_INSTRUCTIONS, &status);
 #if defined(__linux__)
-        if (boot && s5l_clcd_running(&machine->clcd))
-            startup_display_seen = true;
-        if (boot && startup_display_seen && !startup_wake_sent &&
+        if (boot && !startup_wake_sent &&
             s5l8900_hibernation_ready(machine)) {
             bool queued_press = engine_button(e, VM_BUTTON_POWER, true);
             bool queued_release = queued_press &&
