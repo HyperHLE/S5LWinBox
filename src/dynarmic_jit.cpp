@@ -20,13 +20,24 @@ public:
     Dynarmic::A32::Jit* jit = nullptr;
     uint64_t ticks_remaining = 0;
     uint64_t ticks_executed = 0;
+
     bool svc_taken = false;
+    bool abort_taken = false;
+    uint32_t abort_far = 0;
+    uint32_t abort_fsr = 0;
+
+    bool code_abort_taken = false;
+    uint32_t code_abort_far = 0;
+    uint32_t code_abort_fsr = 0;
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
         uint32_t pa = 0;
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
         uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_FETCH, priv, &pa);
         if (fsr != 0) {
+            code_abort_taken = true;
+            code_abort_far = vaddr;
+            code_abort_fsr = fsr;
             return std::nullopt;
         }
 
@@ -93,12 +104,13 @@ public:
         uint32_t ret_addr = jit->Regs()[15];
         uint32_t saved_cpsr = jit->Cpsr();
 
-        for (int i = 0; i < 14; ++i) {
+        for (int i = 0; i < 15; ++i) {
             machine->cpu.r[i] = jit->Regs()[i];
         }
+        machine->cpu.cpsr = saved_cpsr;
 
         arm_set_mode(&machine->cpu, ARM_MODE_SVC);
-        machine->cpu.spsr[ARM_BANK_SVC] = saved_cpsr;
+        machine->cpu.spsr[arm_bank_of_mode(ARM_MODE_SVC)] = saved_cpsr;
         machine->cpu.r[14] = ret_addr;
         machine->cpu.cpsr |= ARM_CPSR_I;
         machine->cpu.cpsr &= ~ARM_CPSR_T;
@@ -160,9 +172,9 @@ private:
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
         uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_READ, priv, &pa);
         if (fsr != 0) {
-            machine->cpu.abort_pending = true;
-            machine->cpu.abort_fsr = fsr;
-            machine->cpu.abort_far = vaddr;
+            abort_taken = true;
+            abort_fsr = fsr;
+            abort_far = vaddr;
             jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
             return 0;
         }
@@ -200,10 +212,18 @@ private:
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
         uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_WRITE, priv, &pa);
         if (fsr != 0) {
-            machine->cpu.abort_pending = true;
-            machine->cpu.abort_fsr = fsr;
-            machine->cpu.abort_far = vaddr;
+            abort_taken = true;
+            abort_fsr = fsr;
+            abort_far = vaddr;
             jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+            return;
+        }
+
+        if (pa >= machine->ram_base && pa + sizeof(T) <= machine->ram_base + machine->ram_size) {
+            if (machine->ram_watch) {
+                s5l8900_ram_changed(machine, pa, sizeof(T));
+            }
+            std::memcpy(&machine->ram[pa - machine->ram_base], &val, sizeof(T));
             return;
         }
 
@@ -218,8 +238,6 @@ private:
                 machine->cpu.bus->write32(machine->cpu.bus->ctx, pa, static_cast<uint32_t>(val));
                 machine->cpu.bus->write32(machine->cpu.bus->ctx, pa + 4, static_cast<uint32_t>(val >> 32));
             }
-        } else if (pa >= machine->ram_base && pa + sizeof(T) <= machine->ram_base + machine->ram_size) {
-            std::memcpy(&machine->ram[pa - machine->ram_base], &val, sizeof(T));
         }
 
         if (machine->level_dirty) {
@@ -233,7 +251,6 @@ struct dynarmic_jit {
     std::unique_ptr<DynarmicCallbacks> callbacks;
     std::unique_ptr<Dynarmic::ExclusiveMonitor> monitor;
     std::unique_ptr<Dynarmic::A32::Jit> jit;
-    uint64_t last_tlb_flushes = 0;
     uint32_t last_ttbr0 = 0;
     uint32_t last_context_id = 0;
 };
@@ -264,7 +281,6 @@ extern "C" dynarmic_jit_t *dynarmic_jit_create(s5l8900_t *machine) {
         return nullptr;
     }
 
-    state->last_tlb_flushes = machine->cpu.tlb_flushes;
     state->last_ttbr0 = machine->cpu.cp15.ttbr0;
     state->last_context_id = machine->cpu.cp15.context_id;
 
@@ -272,9 +288,7 @@ extern "C" dynarmic_jit_t *dynarmic_jit_create(s5l8900_t *machine) {
 }
 
 extern "C" void dynarmic_jit_destroy(dynarmic_jit_t *jit) {
-    if (jit) {
-        delete jit;
-    }
+    delete jit;
 }
 
 extern "C" void dynarmic_jit_clear_cache(dynarmic_jit_t *jit) {
@@ -285,7 +299,7 @@ extern "C" void dynarmic_jit_clear_cache(dynarmic_jit_t *jit) {
 
 extern "C" void dynarmic_jit_invalidate_range(dynarmic_jit_t *jit, uint32_t start_addr, size_t length) {
     if (jit && jit->jit) {
-        jit->jit->InvalidateCacheRange(start_addr, length);
+        jit->jit->InvalidateBasicBlocks(start_addr, length);
     }
 }
 
@@ -296,11 +310,9 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
     auto& jit = *jit_wrapper->jit;
     auto& cb = *jit_wrapper->callbacks;
 
-    if (machine->cpu.tlb_flushes != jit_wrapper->last_tlb_flushes ||
-        machine->cpu.cp15.ttbr0 != jit_wrapper->last_ttbr0 ||
+    if (machine->cpu.cp15.ttbr0 != jit_wrapper->last_ttbr0 ||
         machine->cpu.cp15.context_id != jit_wrapper->last_context_id) {
         jit.ClearCache();
-        jit_wrapper->last_tlb_flushes = machine->cpu.tlb_flushes;
         jit_wrapper->last_ttbr0 = machine->cpu.cp15.ttbr0;
         jit_wrapper->last_context_id = machine->cpu.cp15.context_id;
     }
@@ -315,6 +327,8 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
     cb.ticks_remaining = max_ticks;
     cb.ticks_executed = 0;
     cb.svc_taken = false;
+    cb.abort_taken = false;
+    cb.code_abort_taken = false;
 
     jit.ClearHalt(Dynarmic::HaltReason::UserDefined1 |
                   Dynarmic::HaltReason::UserDefined2 |
@@ -329,6 +343,24 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
         cb.svc_taken = false;
         for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
         machine->cpu.vfp_fpscr = jit.Fpscr();
+    } else if (cb.abort_taken) {
+        cb.abort_taken = false;
+        for (int i = 0; i < 15; ++i) machine->cpu.r[i] = regs[i];
+        machine->cpu.cpsr = jit.Cpsr();
+        for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
+        machine->cpu.vfp_fpscr = jit.Fpscr();
+
+        uint32_t fault_pc = regs[15];
+        arm_take_data_abort_ex(&machine->cpu, fault_pc, cb.abort_far, cb.abort_fsr);
+    } else if (cb.code_abort_taken) {
+        cb.code_abort_taken = false;
+        for (int i = 0; i < 15; ++i) machine->cpu.r[i] = regs[i];
+        machine->cpu.cpsr = jit.Cpsr();
+        for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
+        machine->cpu.vfp_fpscr = jit.Fpscr();
+
+        uint32_t fault_pc = cb.code_abort_far;
+        arm_take_prefetch_abort_ex(&machine->cpu, fault_pc, cb.code_abort_fsr);
     } else {
         for (int i = 0; i < 16; ++i) machine->cpu.r[i] = regs[i];
         machine->cpu.cpsr = jit.Cpsr();

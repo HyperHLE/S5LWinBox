@@ -2967,10 +2967,10 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
             (!m->pre_step_hook || !pre_step_target_matches(m, m->cpu.r[15]))) {
 
             unsigned batch = max_steps - n;
-            if (batch > 100000u) batch = 100000u;
+            if (batch > 20000u) batch = 20000u;
 
             uint32_t retired = m->jit_ops->run(m->jit, batch);
-            if (retired > 0) {
+            if (retired > 0 || (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) {
                 n += retired;
                 m->jit_retired += retired;
                 run_clock_retired(m, &active_clock,

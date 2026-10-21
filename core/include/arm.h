@@ -711,6 +711,10 @@ arm_status_t arm_step(arm_cpu_t *cpu);
 /* Evaluate an ARM 4-bit condition field against the current flags. */
 bool arm_cond_passed(const arm_cpu_t *cpu, uint32_t cond);
 
+/* Vector a data abort or prefetch abort exception into Abort mode */
+void arm_take_data_abort_ex(arm_cpu_t *c, uint32_t pc, uint32_t far, uint32_t fsr);
+void arm_take_prefetch_abort_ex(arm_cpu_t *c, uint32_t pc, uint32_t ifsr);
+
 #ifdef __cplusplus
 }
 #endif
