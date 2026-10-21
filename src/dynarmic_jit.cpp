@@ -7,12 +7,98 @@
 #include "dynarmic_jit.h"
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/A32/config.h>
+#include <dynarmic/interface/A32/coprocessor.h>
 #include <dynarmic/interface/exclusive_monitor.h>
 #include <dynarmic/interface/optimization_flags.h>
 
 #include <memory>
 #include <cstring>
 #include <cstdio>
+
+class DynarmicCP15 final : public Dynarmic::A32::Coprocessor {
+public:
+    s5l8900_t* machine = nullptr;
+    Dynarmic::A32::Jit* jit = nullptr;
+    uint32_t dummy_sink = 0;
+
+    static std::uint64_t Ignore(void*, std::uint32_t, std::uint32_t) {
+        return 0;
+    }
+
+    static Callback CallbackForIgnoredOperation() {
+        return Callback{&Ignore, std::nullopt};
+    }
+
+    static std::uint64_t InvalidateCacheCallback(void* arg, std::uint32_t, std::uint32_t) {
+        auto* jit_instance = static_cast<Dynarmic::A32::Jit*>(arg);
+        if (jit_instance) {
+            jit_instance->ClearCache();
+        }
+        return 0;
+    }
+
+    CallbackOrAccessOneWord CompileGetOneWord(bool /*two*/, unsigned /*opc1*/, CoprocReg CRn,
+                                             CoprocReg CRm, unsigned opc2) override {
+        unsigned n = static_cast<unsigned>(CRn);
+        unsigned m = static_cast<unsigned>(CRm);
+
+        if (n == 13 && m == 0) {
+            if (opc2 == 3) {
+                // TPIDRURO: Read-only thread ID (cthread_self / pthread_self)
+                return &machine->cpu.cp15.tpidruro;
+            } else if (opc2 == 2) {
+                // TPIDRURW: Read-write thread ID
+                return &machine->cpu.cp15.tpidrurw;
+            } else if (opc2 == 1) {
+                // Context ID
+                return &machine->cpu.cp15.context_id;
+            }
+        }
+        return CallbackForIgnoredOperation();
+    }
+
+    CallbackOrAccessOneWord CompileSendOneWord(bool /*two*/, unsigned /*opc1*/, CoprocReg CRn,
+                                              CoprocReg CRm, unsigned opc2) override {
+        unsigned n = static_cast<unsigned>(CRn);
+        unsigned m = static_cast<unsigned>(CRm);
+
+        if (n == 13 && m == 0 && opc2 == 2) {
+            // TPIDRURW: Read-write thread ID
+            return &machine->cpu.cp15.tpidrurw;
+        } else if (n == 7) {
+            if (m == 5) {
+                // Instruction cache invalidate: clear JIT translation cache
+                return Callback{&InvalidateCacheCallback, jit};
+            }
+            // Other cache/barrier ops are no-ops
+            return &dummy_sink;
+        }
+        return CallbackForIgnoredOperation();
+    }
+
+    std::optional<Callback> CompileInternalOperation(bool, unsigned, CoprocReg,
+                                                    CoprocReg, CoprocReg, unsigned) override {
+        return CallbackForIgnoredOperation();
+    }
+
+    CallbackOrAccessTwoWords CompileSendTwoWords(bool, unsigned, CoprocReg) override {
+        return CallbackForIgnoredOperation();
+    }
+
+    CallbackOrAccessTwoWords CompileGetTwoWords(bool, unsigned, CoprocReg) override {
+        return CallbackForIgnoredOperation();
+    }
+
+    std::optional<Callback> CompileLoadWords(bool, bool, CoprocReg,
+                                             std::optional<std::uint8_t>) override {
+        return CallbackForIgnoredOperation();
+    }
+
+    std::optional<Callback> CompileStoreWords(bool, bool, CoprocReg,
+                                              std::optional<std::uint8_t>) override {
+        return CallbackForIgnoredOperation();
+    }
+};
 
 class DynarmicCallbacks final : public Dynarmic::A32::UserCallbacks {
 public:
@@ -26,13 +112,30 @@ public:
     uint32_t abort_far = 0;
     uint32_t abort_fsr = 0;
 
-
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
         uint32_t pa = 0;
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
         uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_FETCH, priv, &pa);
         if (fsr != 0) {
             return std::nullopt;
+        }
+
+        if ((vaddr & 0xfffu) > 0x1000u - 4u) {
+            uint32_t val = 0;
+            for (size_t i = 0; i < 4; ++i) {
+                uint32_t byte_pa = 0;
+                uint32_t byte_va = vaddr + static_cast<uint32_t>(i);
+                uint32_t byte_fsr = arm_mmu_translate(&machine->cpu, byte_va, ARM_ACCESS_FETCH, priv, &byte_pa);
+                if (byte_fsr != 0) return std::nullopt;
+                uint8_t b = 0;
+                if (byte_pa >= machine->ram_base && byte_pa < machine->ram_base + machine->ram_size) {
+                    b = machine->ram[byte_pa - machine->ram_base];
+                } else if (machine->cpu.bus && machine->cpu.bus->read8) {
+                    b = machine->cpu.bus->read8(machine->cpu.bus->ctx, byte_pa);
+                }
+                val |= static_cast<uint32_t>(b) << (8 * i);
+            }
+            return val;
         }
 
         if (pa >= machine->ram_base && pa + 4 <= machine->ram_base + machine->ram_size) {
@@ -48,14 +151,17 @@ public:
         return std::nullopt;
     }
 
-    bool PreCodeReadHook(bool /*is_thumb*/, Dynarmic::A32::VAddr pc, Dynarmic::A32::IREmitter& /*ir*/) override {
-        if (machine->pre_step_hook && s5l8900_pre_step_target(machine, pc)) {
-            return false;
-        }
+    bool PreCodeReadHook(bool /*is_thumb*/, Dynarmic::A32::VAddr /*pc*/, Dynarmic::A32::IREmitter& /*ir*/) override {
         return true;
     }
 
     void PreCodeTranslationHook(bool /*is_thumb*/, Dynarmic::A32::VAddr /*pc*/, Dynarmic::A32::IREmitter& /*ir*/) override {
+    }
+
+    void InstructionSynchronizationBarrierRaised() override {
+        if (jit) {
+            jit->ClearCache();
+        }
     }
 
     std::uint8_t MemoryRead8(Dynarmic::A32::VAddr vaddr) override { return ReadMemory<uint8_t>(vaddr); }
@@ -162,8 +268,35 @@ public:
 private:
     template <typename T>
     T ReadMemory(Dynarmic::A32::VAddr vaddr) {
-        uint32_t pa = 0;
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
+
+        if constexpr (sizeof(T) > 1) {
+            if (((vaddr & 0xfffu) + sizeof(T)) > 0x1000u) {
+                T result = 0;
+                for (size_t i = 0; i < sizeof(T); ++i) {
+                    uint32_t pa = 0;
+                    uint32_t a = vaddr + static_cast<uint32_t>(i);
+                    uint32_t fsr = arm_mmu_translate(&machine->cpu, a, ARM_ACCESS_READ, priv, &pa);
+                    if (fsr != 0) {
+                        abort_taken = true;
+                        abort_fsr = fsr;
+                        abort_far = a;
+                        jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+                        return 0;
+                    }
+                    uint8_t b = 0;
+                    if (pa >= machine->ram_base && pa < machine->ram_base + machine->ram_size) {
+                        b = machine->ram[pa - machine->ram_base];
+                    } else if (machine->cpu.bus && machine->cpu.bus->read8) {
+                        b = machine->cpu.bus->read8(machine->cpu.bus->ctx, pa);
+                    }
+                    result |= static_cast<T>(b) << (8 * i);
+                }
+                return result;
+            }
+        }
+
+        uint32_t pa = 0;
         uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_READ, priv, &pa);
         if (fsr != 0) {
             abort_taken = true;
@@ -202,8 +335,36 @@ private:
 
     template <typename T>
     void WriteMemory(Dynarmic::A32::VAddr vaddr, T val) {
-        uint32_t pa = 0;
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
+
+        if constexpr (sizeof(T) > 1) {
+            if (((vaddr & 0xfffu) + sizeof(T)) > 0x1000u) {
+                for (size_t i = 0; i < sizeof(T); ++i) {
+                    uint32_t pa = 0;
+                    uint32_t a = vaddr + static_cast<uint32_t>(i);
+                    uint32_t fsr = arm_mmu_translate(&machine->cpu, a, ARM_ACCESS_WRITE, priv, &pa);
+                    if (fsr != 0) {
+                        abort_taken = true;
+                        abort_fsr = fsr;
+                        abort_far = a;
+                        jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+                        return;
+                    }
+                    uint8_t b = static_cast<uint8_t>((val >> (8 * i)) & 0xff);
+                    if (pa >= machine->ram_base && pa < machine->ram_base + machine->ram_size) {
+                        if (machine->ram_watch) {
+                            s5l8900_ram_changed(machine, pa, 1);
+                        }
+                        machine->ram[pa - machine->ram_base] = b;
+                    } else if (machine->cpu.bus && machine->cpu.bus->write8) {
+                        machine->cpu.bus->write8(machine->cpu.bus->ctx, pa, b);
+                    }
+                }
+                return;
+            }
+        }
+
+        uint32_t pa = 0;
         uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_WRITE, priv, &pa);
         if (fsr != 0) {
             abort_taken = true;
@@ -242,6 +403,7 @@ private:
 
 struct dynarmic_jit {
     s5l8900_t* machine = nullptr;
+    std::shared_ptr<DynarmicCP15> cp15;
     std::unique_ptr<DynarmicCallbacks> callbacks;
     std::unique_ptr<Dynarmic::ExclusiveMonitor> monitor;
     std::unique_ptr<Dynarmic::A32::Jit> jit;
@@ -253,23 +415,28 @@ extern "C" dynarmic_jit_t *dynarmic_jit_create(s5l8900_t *machine) {
 
     auto state = std::make_unique<dynarmic_jit>();
     state->machine = machine;
+    state->cp15 = std::make_shared<DynarmicCP15>();
+    state->cp15->machine = machine;
     state->callbacks = std::make_unique<DynarmicCallbacks>();
     state->callbacks->machine = machine;
     state->monitor = std::make_unique<Dynarmic::ExclusiveMonitor>(1);
 
     Dynarmic::A32::UserConfig conf;
     conf.callbacks = state->callbacks.get();
+    conf.coprocessors[15] = state->cp15;
     conf.arch_version = Dynarmic::A32::ArchVersion::v6K;
     conf.optimizations = Dynarmic::all_safe_optimizations;
     conf.enable_cycle_counting = true;
     conf.always_little_endian = true;
     conf.check_halt_on_memory_access = true;
+    conf.hook_isb = true;
     conf.global_monitor = state->monitor.get();
     conf.code_cache_size = 64 * 1024 * 1024;
 
     try {
         state->jit = std::make_unique<Dynarmic::A32::Jit>(conf);
         state->callbacks->jit = state->jit.get();
+        state->cp15->jit = state->jit.get();
     } catch (...) {
         return nullptr;
     }
