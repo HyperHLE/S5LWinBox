@@ -183,12 +183,15 @@ static inline int portable_rm_rf(const char *path) {
 
 #else
 
+#include <errno.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <strings.h>
 
+#define _stricmp strcasecmp
 #define portable_pread pread
 
 typedef void *s5l_dynlib_t;
@@ -198,21 +201,56 @@ typedef void *s5l_dynlib_t;
 
 static inline int portable_rm_rf(const char *path) {
     struct stat st;
-    if (!path || lstat(path, &st) != 0) return 0;
-    if (S_ISDIR(st.st_mode)) {
-        DIR *d = opendir(path);
-        struct dirent *ent;
-        if (!d) return -1;
-        while ((ent = readdir(d)) != NULL) {
-            char child[1024];
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-            snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
-            portable_rm_rf(child);
-        }
-        closedir(d);
-        return rmdir(path);
+    if (!path) {
+        errno = EINVAL;
+        return -1;
     }
-    return unlink(path);
+    if (lstat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode)) return unlink(path);
+
+    DIR *d = opendir(path);
+    if (!d) return -1;
+
+    int result = 0;
+    int saved_errno = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        size_t path_len = strlen(path);
+        size_t name_len = strlen(ent->d_name);
+        if (path_len > SIZE_MAX - name_len - 2) {
+            result = -1;
+            saved_errno = ENAMETOOLONG;
+            break;
+        }
+        size_t child_len = path_len + name_len + 2;
+        char *child = malloc(child_len);
+        if (!child) {
+            result = -1;
+            saved_errno = errno;
+            break;
+        }
+        memcpy(child, path, path_len);
+        child[path_len] = '/';
+        memcpy(child + path_len + 1, ent->d_name, name_len + 1);
+        if (portable_rm_rf(child) != 0) {
+            result = -1;
+            saved_errno = errno;
+        }
+        free(child);
+        if (result != 0) break;
+    }
+
+    if (closedir(d) != 0 && result == 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    if (result == 0 && rmdir(path) != 0) {
+        result = -1;
+        saved_errno = errno;
+    }
+    if (result != 0) errno = saved_errno;
+    return result;
 }
 
 #endif

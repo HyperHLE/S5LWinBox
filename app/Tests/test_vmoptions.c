@@ -252,6 +252,38 @@ static void test_new_machine_defaults(void) {
           "invalid saved-value index resolved");
 }
 
+static void test_desktop_machine_defaults(void) {
+    int mbx = vm_option_index("mbx");
+    int ca = vm_option_index("ca-software-render");
+    CHECK(mbx >= 0 && ca >= 0, "desktop renderer options are missing");
+    if (mbx < 0 || ca < 0) return;
+    unsigned mbx_index = (unsigned)mbx;
+    unsigned ca_index = (unsigned)ca;
+#if defined(__linux__)
+    CHECK(!vm_option_new_desktop_machine_value(mbx_index, false, false),
+          "Linux desktop must disable experimental MBX for new machines");
+    CHECK(vm_option_new_desktop_machine_value(ca_index, false, false),
+          "Linux desktop must enable QuartzCore software rendering for new machines");
+#else
+    CHECK(vm_option_new_desktop_machine_value(mbx_index, false, false) ==
+              vm_option_new_machine_value(mbx_index, false, false),
+          "other desktop platforms must retain the product MBX default");
+    CHECK(vm_option_new_desktop_machine_value(ca_index, false, false) ==
+              vm_option_new_machine_value(ca_index, false, false),
+          "other desktop platforms must retain the product QuartzCore default");
+#endif
+    CHECK(!vm_option_new_desktop_machine_value(mbx_index, true, false),
+          "saved MBX-off choice was not preserved");
+    CHECK(vm_option_new_desktop_machine_value(mbx_index, true, true),
+          "saved MBX-on choice was not preserved");
+    CHECK(!vm_option_new_desktop_machine_value(ca_index, true, false),
+          "saved QuartzCore-off choice was not preserved");
+    CHECK(vm_option_new_desktop_machine_value(ca_index, true, true),
+          "saved QuartzCore-on choice was not preserved");
+    CHECK(!vm_option_new_desktop_machine_value(vm_option_count(), false, true),
+          "invalid desktop option index resolved");
+}
+
 static void test_command_line_truncation_and_nulls(void) {
     bool values[64];
     defaults_into(values);
@@ -386,6 +418,7 @@ int main(int argc, char **argv) {
     test_lookup();
     test_command_line();
     test_new_machine_defaults();
+    test_desktop_machine_defaults();
     test_command_line_truncation_and_nulls();
     test_omissions();
 

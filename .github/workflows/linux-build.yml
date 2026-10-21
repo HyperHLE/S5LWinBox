@@ -1,0 +1,63 @@
+name: Build S5LWinBox (Linux x64)
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Smoke Test Linux x64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libasound2-dev libdbus-1-dev libdrm-dev libegl1-mesa-dev \
+            libgbm-dev libgl-dev libgles2-mesa-dev libpulse-dev libudev-dev \
+            libwayland-dev libwayland-egl-backend-dev wayland-protocols \
+            libx11-dev libxext-dev libxcursor-dev libxfixes-dev libxi-dev \
+            libxkbcommon-dev libxrandr-dev libxrender-dev libxss-dev libdecor-0-dev \
+            libgl1-mesa-dri xauth xvfb curl
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build S5LWinBox
+        run: cmake --build build --target s5lwinbox --parallel 2
+
+      - name: Smoke-test Linux GUI, GLES and Web Inspector
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          SDL_AUDIODRIVER: dummy
+        run: |
+          xvfb-run -a bash -euo pipefail -c '
+            timeout --signal=TERM --kill-after=5s 10s ./build/s5lwinbox --data "$RUNNER_TEMP/s5lwinbox-smoke" > "$RUNNER_TEMP/s5lwinbox.log" 2>&1 &
+            app=$!
+            for _ in $(seq 1 100); do
+              if curl --silent --fail --max-time 1 http://127.0.0.1:8080/ -o "$RUNNER_TEMP/inspector.html"; then
+                break
+              fi
+              sleep 0.1
+            done
+            status=0
+            wait "$app" || status=$?
+            cat "$RUNNER_TEMP/s5lwinbox.log"
+            test "$status" -eq 124
+            grep -Fq "hyperhle-gles: acceleration initialized and armed" "$RUNNER_TEMP/s5lwinbox.log"
+            grep -Fq "Web Log Inspector: http://localhost:8080" "$RUNNER_TEMP/s5lwinbox.log"
+            grep -Fq "S5LWinBox / S5LPCBox &bull; Web Inspector & Manager" "$RUNNER_TEMP/inspector.html"
+          '
