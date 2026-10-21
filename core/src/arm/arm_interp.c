@@ -546,6 +546,7 @@ void arm_take_prefetch_abort_ex(arm_cpu_t *c, uint32_t pc, uint32_t ifsr) {
         c->bus->user_fault_observer(c->bus->user_fault_ctx, c, ARM_VEC_PREFETCH, pc, ifsr);
     c->abort_pending = false;
     c->cp15.ifsr = ifsr;
+    c->cp15.ifar = pc;
     take_exception(c, ARM_VEC_PREFETCH, ARM_MODE_ABT, pc + 4u, false, &vec);
     c->r[15] = vec;
 }
