@@ -21,6 +21,10 @@
 #include "arm.h"
 #include "arm_ram_watch.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ------------------------------------------------------------ memory map
  *
  * CONFIRMED from the shipped device tree (firmware/devicetree.bin, iPhone1,2
@@ -4480,7 +4484,22 @@ typedef struct {
     /* Host lifecycle wiring, deliberately not serialized. */
     s5l_restart_host_service_fn restart_host_service;
     void                       *restart_host_ctx;
+
+    /* Host-only JIT backend and instruction counter. snap_mach() deliberately
+     * excludes these fields so a snapshot restore retains live host state and
+     * the on-disk snapshot format remains unchanged. */
+    void                       *jit;
+    const struct s5l_jit_ops   *jit_ops;
+    uint64_t                    jit_retired;
 } s5l8900_t;
+
+typedef struct s5l_jit_ops {
+    uint32_t (*run)(void *jit, uint32_t max_ticks);
+    void     (*clear_cache)(void *jit);
+    void     (*destroy)(void *jit);
+} s5l_jit_ops_t;
+
+void s5l8900_set_jit(s5l8900_t *m, void *jit, const s5l_jit_ops_t *ops);
 
 /*
  * Declare a stub window. `name` must be a string literal or otherwise outlive
@@ -5126,5 +5145,9 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status);
  * of guest state or a snapshot. */
 uint64_t s5l8900_interpreter_tick_batches(const s5l8900_t *m);
 uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* S5LBOX_SOC_H */

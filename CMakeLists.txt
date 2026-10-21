@@ -3,7 +3,7 @@ project(S5LWinBox C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(S5LBOX_BUILD_HYPERHLE_GLES "Build the optional HyperHLE GLES backend when Cargo is available" ON)
@@ -11,6 +11,35 @@ option(S5LBOX_BUILD_HYPERHLE_GLES "Build the optional HyperHLE GLES backend when
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
+
+# Boost headers via FetchContent for Dynarmic
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 OLD)
+endif()
+
+include(FetchContent)
+FetchContent_Declare(
+    boost
+    GIT_REPOSITORY https://github.com/Vita3K/ext-boost.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(boost)
+if(NOT boost_POPULATED)
+    FetchContent_Populate(boost)
+    set(BOOST_ROOT "${boost_SOURCE_DIR}" CACHE PATH "" FORCE)
+    set(Boost_INCLUDE_DIR "${boost_SOURCE_DIR}" CACHE PATH "" FORCE)
+    set(ENV{BOOST_ROOT} "${boost_SOURCE_DIR}")
+    message(STATUS "Self-contained Boost populated at: ${boost_SOURCE_DIR}")
+endif()
+
+# Dynarmic A32 JIT configuration
+set(DYNARMIC_FRONTENDS "A32" CACHE STRING "" FORCE)
+set(DYNARMIC_TESTS OFF CACHE BOOL "" FORCE)
+set(DYNARMIC_USE_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
+set(DYNARMIC_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+set(DYNARMIC_FATAL_ERRORS OFF CACHE BOOL "" FORCE)
+set(DYNARMIC_USE_BUNDLED_EXTERNALS ON CACHE BOOL "" FORCE)
 
 # Portable emulator core & support libraries
 add_subdirectory(core)
@@ -25,6 +54,15 @@ set(SDL_SHARED TRUE CACHE BOOL "Build shared SDL library" FORCE)
 set(SDL_STATIC FALSE CACHE BOOL "Build static SDL library" FORCE)
 set(SDL_TEST FALSE CACHE BOOL "Disable SDL tests" FORCE)
 FetchContent_MakeAvailable(SDL2)
+
+# Dynarmic A32 via FetchContent
+FetchContent_Declare(
+    dynarmic
+    GIT_REPOSITORY https://github.com/lioncash/dynarmic.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(dynarmic)
 
 # Determine SDL2 target name
 if(TARGET SDL2::SDL2)
@@ -45,6 +83,7 @@ add_executable(s5lwinbox
     src/engine.c
     src/engine_ipa.c
     src/web_log_server.c
+    src/dynarmic_jit.cpp
     ${S5L_APP_SOURCES}
 )
 
@@ -61,6 +100,7 @@ target_compile_definitions(s5lwinbox PRIVATE
     S5LBOX_IOS3_HLE_EXPERIMENT=1
     S5LBOX_IOS_WFI_REALTIME_PACING=1
     S5LBOX_IOS_ACTIVE_REALTIME_CLOCK=1
+    S5LBOX_DYNARMIC_JIT=1
     SDL_MAIN_HANDLED=1
 )
 
@@ -71,8 +111,13 @@ else()
     target_compile_options(s5lwinbox PRIVATE -Wall -Wextra -Wno-unused-parameter -O3 -fomit-frame-pointer)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(s5lwinbox PRIVATE -static-libstdc++)
+endif()
+
 target_link_libraries(s5lwinbox PRIVATE
     ${S5L_SDL_TARGET}
+    dynarmic
     emucore
     nethost
     host_file_block

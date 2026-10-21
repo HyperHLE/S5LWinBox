@@ -527,15 +527,31 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
 /* Complete a data abort latched by the translating memory helpers. This is a
  * helper rather than only arm_step's tail path because unconditional SRS/RFE
  * return directly from their decoder and must take the same exception there. */
-static void take_pending_data_abort(arm_cpu_t *c, uint32_t pc) {
+void arm_take_data_abort_ex(arm_cpu_t *c, uint32_t pc, uint32_t far, uint32_t fsr) {
     uint32_t vec;
+    c->abort_far = far;
+    c->abort_fsr = fsr;
     if (c->bus && c->bus->user_fault_observer && !cpu_is_priv(c))
-        c->bus->user_fault_observer(c->bus->user_fault_ctx, c, ARM_VEC_DATA_ABORT, c->abort_far, c->abort_fsr);
+        c->bus->user_fault_observer(c->bus->user_fault_ctx, c, ARM_VEC_DATA_ABORT, far, fsr);
     c->abort_pending = false;
-    c->cp15.dfsr = c->abort_fsr;
-    c->cp15.dfar = c->abort_far;
+    c->cp15.dfsr = fsr;
+    c->cp15.dfar = far;
     take_exception(c, ARM_VEC_DATA_ABORT, ARM_MODE_ABT, pc + 8u, false, &vec);
     c->r[15] = vec;
+}
+
+void arm_take_prefetch_abort_ex(arm_cpu_t *c, uint32_t pc, uint32_t ifsr) {
+    uint32_t vec;
+    if (c->bus && c->bus->user_fault_observer && !cpu_is_priv(c))
+        c->bus->user_fault_observer(c->bus->user_fault_ctx, c, ARM_VEC_PREFETCH, pc, ifsr);
+    c->abort_pending = false;
+    c->cp15.ifsr = ifsr;
+    take_exception(c, ARM_VEC_PREFETCH, ARM_MODE_ABT, pc + 4u, false, &vec);
+    c->r[15] = vec;
+}
+
+static void take_pending_data_abort(arm_cpu_t *c, uint32_t pc) {
+    arm_take_data_abort_ex(c, pc, c->abort_far, c->abort_fsr);
 }
 
 /* ============================ the Undefined-instruction discrimination =====

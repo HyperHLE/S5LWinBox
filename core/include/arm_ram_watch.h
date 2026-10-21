@@ -3,6 +3,10 @@
 #define S5LBOX_ARM_RAM_WATCH_H
 #include "arm.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct arm_ram_watch arm_ram_watch_t;
 
 /* The owner must revoke old full-window WRITE grants before installing this
@@ -24,4 +28,7 @@ bool arm_ram_watch_unwatched(const arm_ram_watch_t *watch,
                              uint32_t pa, uint32_t length);
 void arm_ram_watch_changed(arm_ram_watch_t *watch,
                            uint32_t pa, uint32_t length);
+#ifdef __cplusplus
+}
+#endif
 #endif

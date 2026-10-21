@@ -237,8 +237,12 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
 /* 258640 adds host-only user SVC/fault observers on arm_bus_t (32) and
  * streaming uart0_host_tx callback/context on s5l8900_t (16), measured
  * from the compiler. Like other bus/host hooks, these are excluded from MACH
- * and retained across load; no serialized byte/version changes. */
-SNAP_SIZE_GUARD(s5l8900_t,         258640, "snap_mach");
+ * and retained across load; no serialized byte/version changes.
+ *
+ * 258664 adds the JIT backend handle, operations table and retired-instruction
+ * counter (24). They are host-only and absent from snap_mach(), so the on-disk
+ * format and SNAPSHOT_VERSION remain unchanged. */
+SNAP_SIZE_GUARD(s5l8900_t,         258664, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */

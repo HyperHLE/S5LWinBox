@@ -55,6 +55,9 @@
 #include "file_block.h"
 #include "web_log_server.h"
 #include "ios3_hle.h"
+#if defined(S5LBOX_DYNARMIC_JIT)
+#include "dynarmic_jit.h"
+#endif
 
 #define ENGINE_LOG_TAG "S5LWinBox"
 #define ENGINE_LOG(...) do { printf("[INFO] " __VA_ARGS__); printf("\n"); fflush(stdout); } while (0)
@@ -2250,6 +2253,12 @@ static bool install_payload(engine_t *e, s5l8900_t *machine,
             memset(machine, 0, sizeof *machine);
             if (!s5l8900_init(machine, VM_GUEST_RAM_BASE, VM_GUEST_RAM_SIZE))
                 return false;
+#if defined(S5LBOX_DYNARMIC_JIT)
+            dynarmic_jit_t *jit = dynarmic_jit_create(machine);
+            if (jit) {
+                s5l8900_set_jit(machine, jit, &g_dynarmic_jit_ops);
+            }
+#endif
         } else {
             pthread_mutex_lock(&e->lock);
             snprintf(e->note, sizeof e->note,
@@ -2585,6 +2594,16 @@ static void engine_thread_main(engine_t *e)
         pthread_mutex_unlock(&e->lock);
         return;
     }
+
+#if defined(S5LBOX_DYNARMIC_JIT)
+    dynarmic_jit_t *jit = dynarmic_jit_create(machine);
+    if (jit) {
+        s5l8900_set_jit(machine, jit, &g_dynarmic_jit_ops);
+        console_append(e, "[jit] Dynarmic A32 JIT compiler activated\n");
+    } else {
+        console_append(e, "[jit] Dynarmic JIT initialization failed; using interpreter\n");
+    }
+#endif
 
     ready = install_payload(e, machine, &boot);
     if (!ready) {

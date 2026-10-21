@@ -1721,6 +1721,11 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
 
 void s5l8900_free(s5l8900_t *m) {
     if (!m) return;
+    if (m->jit && m->jit_ops && m->jit_ops->destroy) {
+        m->jit_ops->destroy(m->jit);
+        m->jit = NULL;
+        m->jit_ops = NULL;
+    }
 #if defined(S5LBOX_STATIC_A64_ENGINE)
     s5l8900_static_a64_dispose(m);
 #endif
@@ -1736,6 +1741,15 @@ void s5l8900_free(s5l8900_t *m) {
     free(m->mbx.edram);
     m->mbx.edram = NULL;
     s5l_nor_free(&m->nor);
+}
+
+void s5l8900_set_jit(s5l8900_t *m, void *jit, const s5l_jit_ops_t *ops) {
+    if (!m) return;
+    if (m->jit && m->jit_ops && m->jit_ops->destroy && m->jit != jit) {
+        m->jit_ops->destroy(m->jit);
+    }
+    m->jit = jit;
+    m->jit_ops = ops;
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
@@ -2945,6 +2959,30 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
             }
         }
 #endif
+
+        if (m->jit && m->jit_ops && m->jit_ops->run &&
+            (m->cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR &&
+            (!m->cpu.irq_line || (m->cpu.cpsr & ARM_CPSR_I)) &&
+            (!m->cpu.fiq_line || (m->cpu.cpsr & ARM_CPSR_F)) &&
+            (!m->pre_step_hook || !pre_step_target_matches(m, m->cpu.r[15]))) {
+
+            unsigned batch = max_steps - n;
+            if (batch > 20000u) batch = 20000u;
+
+            uint32_t retired = m->jit_ops->run(m->jit, batch);
+            if (retired > 0 || (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) {
+                n += retired;
+                m->jit_retired += retired;
+                run_clock_retired(m, &active_clock,
+                                  &active_pending_retired, retired,
+                                  st != ARM_OK,
+                                  m->level_dirty ||
+                                  ext_inputs(m) != m->ext_seen ||
+                                  (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR);
+                if (st != ARM_OK) break;
+                continue;
+            }
+        }
 
         /* A limit of one cannot save a tick call, so retain the smaller
          * ordinary path at the edge itself. Inside a real batch, inspect every
