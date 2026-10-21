@@ -105,7 +105,7 @@ target_compile_definitions(s5lwinbox PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(s5lwinbox PRIVATE /W3 /utf-8 $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics> /O2 /Oi /Ot /Oy /GF /Gy)
+    target_compile_options(s5lwinbox PRIVATE /W3 /utf-8 /experimental:c11atomics /O2 /Oi /Ot /Oy /GF /Gy)
     target_link_options(s5lwinbox PRIVATE /OPT:REF /OPT:ICF)
 else()
     target_compile_options(s5lwinbox PRIVATE -Wall -Wextra -Wno-unused-parameter -O3 -fomit-frame-pointer)
