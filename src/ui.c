@@ -850,7 +850,17 @@ void ui_render(ui_state_t *ui, engine_t *engine, SDL_Renderer *renderer, int win
         }
     }
 
-    /* 3. Render Toast Notification Banner */
+    /* 3. Screen Sleeping Indicator */
+    if (!ui->mm_open && engine && !engine_is_display_running(engine)) {
+        SDL_Rect hint_rect = { ui->screen_rect.x, ui->screen_rect.y + ui->screen_rect.h / 2 - 14,
+                               ui->screen_rect.w, 20 };
+        ui_draw_text_centered(renderer, &hint_rect, "Screen Sleeping", 1, COLOR_TEXT_DIM);
+        SDL_Rect sub_rect = { ui->screen_rect.x, ui->screen_rect.y + ui->screen_rect.h / 2 + 10,
+                              ui->screen_rect.w, 20 };
+        ui_draw_text_centered(renderer, &sub_rect, "Click screen or press HOME to wake", 1, COLOR_TEXT_MUTED);
+    }
+
+    /* 4. Render Toast Notification Banner */
     uint32_t now = SDL_GetTicks();
     if (ui->toast[0] && now < ui->toast_until) {
         int tw = (int)strlen(ui->toast) * 8 + 30;

@@ -64,6 +64,12 @@ jobs:
             Copy-Item $gles.FullName package/ -Force
           }
           
+          if (Test-Path tools/angle/libEGL.dll) {
+            Write-Host "Found tools/angle/libEGL.dll"
+            Copy-Item tools/angle/libEGL.dll package/ -Force
+            Copy-Item tools/angle/libGLESv2.dll package/ -Force
+          }
+          
           Copy-Item README.md package/ -Force -ErrorAction SilentlyContinue
           Copy-Item LICENSE package/ -Force -ErrorAction SilentlyContinue
           

@@ -90,11 +90,21 @@ else()
     target_link_libraries(s5lwinbox PRIVATE m dl)
 endif()
 
-# Copy SDL2.dll next to executable on Windows
-if(WIN32 AND TARGET ${S5L_SDL_TARGET})
-    add_custom_command(TARGET s5lwinbox POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:${S5L_SDL_TARGET}>
-            $<TARGET_FILE_DIR:s5lwinbox>
-    )
+# Copy SDL2.dll and ANGLE DLLs next to executable on Windows
+if(WIN32)
+    if(TARGET ${S5L_SDL_TARGET})
+        add_custom_command(TARGET s5lwinbox POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:${S5L_SDL_TARGET}>
+                $<TARGET_FILE_DIR:s5lwinbox>
+        )
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tools/angle/libEGL.dll")
+        add_custom_command(TARGET s5lwinbox POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/tools/angle/libEGL.dll"
+                "${CMAKE_SOURCE_DIR}/tools/angle/libGLESv2.dll"
+                $<TARGET_FILE_DIR:s5lwinbox>
+        )
+    endif()
 endif()

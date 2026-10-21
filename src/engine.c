@@ -22,6 +22,14 @@
 #include <sys/types.h>
 #include <time.h>
 
+#ifndef O_BINARY
+#  ifdef _O_BINARY
+#    define O_BINARY _O_BINARY
+#  else
+#    define O_BINARY 0
+#  endif
+#endif
+
 #include "soc.h"
 #include "usb_host.h"
 
@@ -866,7 +874,7 @@ static bool persist_instances_locked(engine_t *e)
     text = malloc(need + 1u);
     if (!text) return false;
     vm_instance_serialize(&e->instances, text, need + 1u);
-    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0660);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY | O_CLOEXEC, 0660);
     if (fd >= 0) {
         ok = write(fd, text, need) == (ssize_t)need;
         if (ok && fsync(fd) != 0) ok = false;
@@ -889,24 +897,84 @@ static void load_instances(engine_t *e)
     int fd;
     vm_instance_list_reset(&e->instances);
     if (!join_path(path, sizeof path, e->machines, "instances.txt")) return;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
-        st.st_size > 1024 * 1024)
-        return;
-    text = malloc((size_t)st.st_size + 1u);
-    if (!text) return;
-    fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        ssize_t got = read(fd, text, (size_t)st.st_size);
-        close(fd);
-        if (got == (ssize_t)st.st_size) {
-            text[got] = '\0';
-            if (vm_instance_deserialize(&e->instances, text) != VM_INSTANCE_OK) {
-                ENGINE_WARN("instances.txt could not be parsed; starting empty");
-                vm_instance_list_reset(&e->instances);
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+        st.st_size <= 1024 * 1024) {
+        text = malloc((size_t)st.st_size + 1u);
+        if (text) {
+            fd = open(path, O_RDONLY | O_BINARY | O_CLOEXEC);
+            if (fd >= 0) {
+                ssize_t got = read(fd, text, (size_t)st.st_size);
+                close(fd);
+                if (got > 0) {
+                    text[got] = '\0';
+                    if (vm_instance_deserialize(&e->instances, text) != VM_INSTANCE_OK) {
+                        ENGINE_WARN("instances.txt could not be parsed; starting empty");
+                        vm_instance_list_reset(&e->instances);
+                    }
+                }
             }
+            free(text);
         }
     }
-    free(text);
+
+    /* Auto-discover existing machines on disk that may not be in instances.txt */
+    bool changed = false;
+#ifdef _WIN32
+    char search[MAX_PATH];
+    snprintf(search, sizeof(search), "%s\\*", e->machines);
+    WIN32_FIND_DATAA fd_find;
+    HANDLE h = FindFirstFileA(search, &fd_find);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd_find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!strcmp(fd_find.cFileName, ".") || !strcmp(fd_find.cFileName, "..")) continue;
+                if (strlen(fd_find.cFileName) == VM_INSTANCE_ID_LEN &&
+                    vm_instance_id_check(fd_find.cFileName) == VM_INSTANCE_OK &&
+                    vm_instance_index_of_id(&e->instances, fd_find.cFileName) < 0) {
+                    char mname[VM_INSTANCE_NAME_MAX + 1u];
+                    snprintf(mname, sizeof mname, "iPhone 3G (%.4s)", fd_find.cFileName);
+                    bool opts[VM_INSTANCE_OPTION_MAX];
+                    for (unsigned o = 0; o < VM_INSTANCE_OPTION_MAX; o++) {
+                        opts[o] = vm_option_new_machine_value(o, false, false);
+                    }
+                    unsigned idx = 0;
+                    if (vm_instance_add(&e->instances, fd_find.cFileName, mname, opts,
+                                        VM_INSTANCE_OPTION_MAX, engine_unix_now(), &idx) == VM_INSTANCE_OK) {
+                        changed = true;
+                    }
+                }
+            }
+        } while (FindNextFileA(h, &fd_find));
+        FindClose(h);
+    }
+#else
+    DIR *d = opendir(e->machines);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            if (strlen(ent->d_name) == VM_INSTANCE_ID_LEN &&
+                vm_instance_id_check(ent->d_name) == VM_INSTANCE_OK &&
+                vm_instance_index_of_id(&e->instances, ent->d_name) < 0) {
+                char mname[VM_INSTANCE_NAME_MAX + 1u];
+                snprintf(mname, sizeof mname, "iPhone 3G (%.4s)", ent->d_name);
+                bool opts[VM_INSTANCE_OPTION_MAX];
+                for (unsigned o = 0; o < VM_INSTANCE_OPTION_MAX; o++) {
+                    opts[o] = vm_option_new_machine_value(o, false, false);
+                }
+                unsigned idx = 0;
+                if (vm_instance_add(&e->instances, ent->d_name, mname, opts,
+                                    VM_INSTANCE_OPTION_MAX, engine_unix_now(), &idx) == VM_INSTANCE_OK) {
+                    changed = true;
+                }
+            }
+        }
+        closedir(d);
+    }
+#endif
+    if (changed) {
+        persist_instances_locked(e);
+    }
 }
 
 static int instance_index_locked(engine_t *e, const char *id)
@@ -1625,7 +1693,20 @@ int engine_get_or_create_default_machine(engine_t *engine, char *out_id, size_t 
 
     pthread_mutex_lock(&e->lock);
     if (e->instances.count > 0) {
-        snprintf(out_id, capacity, "%s", e->instances.slot[0].id);
+        /* Prefer an instance that has an existing provisioned rootfs-work.img */
+        int best_idx = -1;
+        for (unsigned i = 0; i < e->instances.count; i++) {
+            char img_path[ENGINE_PATH_CAP];
+            struct stat st;
+            if (join_path(img_path, sizeof img_path, e->machines, e->instances.slot[i].id) &&
+                join_path(img_path, sizeof img_path, img_path, "rootfs-work.img") &&
+                stat(img_path, &st) == 0 && st.st_size > 1000000) {
+                best_idx = (int)i;
+                break;
+            }
+        }
+        if (best_idx < 0) best_idx = 0;
+        snprintf(out_id, capacity, "%s", e->instances.slot[best_idx].id);
         pthread_mutex_unlock(&e->lock);
         return 0;
     }
@@ -3087,7 +3168,7 @@ bool engine_copy_frame(engine_t *engine, void *dst_pixels, size_t dst_capacity,
 {
     if (!engine || !dst_pixels) return false;
     pthread_mutex_lock(&engine->lock);
-    if (!engine->snapshot || !engine->have_frame) {
+    if (!engine->snapshot || !engine->have_frame || !engine->snapshot_fresh) {
         pthread_mutex_unlock(&engine->lock);
         return false;
     }
@@ -3131,10 +3212,21 @@ bool engine_copy_frame(engine_t *engine, void *dst_pixels, size_t dst_capacity,
         }
     }
 
-    bool fresh = engine->snapshot_fresh;
     engine->snapshot_fresh = false;
     pthread_mutex_unlock(&engine->lock);
-    return fresh;
+    return true;
+}
+
+bool engine_is_display_running(engine_t *engine)
+{
+    if (!engine) return false;
+    pthread_mutex_lock(&engine->lock);
+    bool running = engine->have_frame && !engine->snapshot_blank;
+    if (engine->machine) {
+        running = s5l_clcd_running(&engine->machine->clcd);
+    }
+    pthread_mutex_unlock(&engine->lock);
+    return running;
 }
 
 /* ------------------------------------------------------------------ audio --- */

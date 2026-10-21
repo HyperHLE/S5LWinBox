@@ -90,6 +90,9 @@ size_t engine_log_entries_json(engine_t *engine, uint32_t last_id, char *out, si
 bool engine_copy_frame(engine_t *engine, void *dst_pixels, size_t dst_capacity,
                        uint32_t *out_width, uint32_t *out_height);
 
+/* Returns true if display is enabled/running (not sleeping/blanked by PMU/CLCD). */
+bool engine_is_display_running(engine_t *engine);
+
 /* ------------------------------------------------------------------ audio */
 /* Drains pending stereo 16-bit PCM audio samples. Returns number of samples read. */
 size_t engine_read_audio_pcm(engine_t *engine, int16_t *dst_samples, size_t max_samples);

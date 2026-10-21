@@ -99,10 +99,13 @@ int main(int argc, char *argv[])
 
     char root_dir[512];
     get_default_data_dir(root_dir, sizeof root_dir);
+    char explicit_machine[64] = {0};
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) {
             snprintf(root_dir, sizeof root_dir, "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--machine") && i + 1 < argc) {
+            snprintf(explicit_machine, sizeof explicit_machine, "%s", argv[++i]);
         }
     }
 
@@ -182,7 +185,17 @@ int main(int argc, char *argv[])
 
     /* Resolve or create default machine */
     char current_machine[64] = {0};
-    if (engine_get_or_create_default_machine(g_engine, current_machine, sizeof current_machine) == 0) {
+    if (explicit_machine[0]) {
+        snprintf(current_machine, sizeof current_machine, "%s", explicit_machine);
+        printf("Selected explicit machine ID: %s\n", current_machine);
+        char start_err[256] = {0};
+        int start_rc = engine_start(g_engine, current_machine, start_err, sizeof start_err);
+        if (start_rc == 0) {
+            printf("Engine started for machine: %s\n", current_machine);
+        } else {
+            printf("Engine start note: %s\n", start_err[0] ? start_err : "waiting for firmware");
+        }
+    } else if (engine_get_or_create_default_machine(g_engine, current_machine, sizeof current_machine) == 0) {
         printf("Selected machine ID: %s\n", current_machine);
         char start_err[256] = {0};
         int start_rc = engine_start(g_engine, current_machine, start_err, sizeof start_err);
@@ -279,7 +292,14 @@ int main(int argc, char *argv[])
                     double gy = (double)(ev.button.y - g_ui.screen_rect.y) / (double)g_ui.screen_scale;
                     if (gx >= 0.0 && gx < (double)GUEST_SCREEN_WIDTH &&
                         gy >= 0.0 && gy < (double)GUEST_SCREEN_HEIGHT) {
-                        engine_touch(g_engine, gx, gy, (double)GUEST_SCREEN_WIDTH, (double)GUEST_SCREEN_HEIGHT, 0 /* BEGAN */);
+                        if (!engine_is_display_running(g_engine)) {
+                            /* Screen is asleep — pulse HOME button to wake it up */
+                            engine_button(g_engine, 0 /* HOME */, true);
+                            engine_button(g_engine, 0 /* HOME */, false);
+                            ui_show_toast(&g_ui, "Waking up display (HOME)...", 1500);
+                        } else {
+                            engine_touch(g_engine, gx, gy, (double)GUEST_SCREEN_WIDTH, (double)GUEST_SCREEN_HEIGHT, 0 /* BEGAN */);
+                        }
                     }
                 }
                 break;

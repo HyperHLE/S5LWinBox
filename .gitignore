@@ -73,4 +73,5 @@ package/
 dist/
 .vs/
 *.dll
+!tools/angle/*.dll
 *.pdb
