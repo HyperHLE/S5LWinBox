@@ -299,7 +299,7 @@ extern "C" void dynarmic_jit_clear_cache(dynarmic_jit_t *jit) {
 
 extern "C" void dynarmic_jit_invalidate_range(dynarmic_jit_t *jit, uint32_t start_addr, size_t length) {
     if (jit && jit->jit) {
-        jit->jit->InvalidateBasicBlocks(start_addr, length);
+        jit->jit->InvalidateCacheRange(start_addr, length);
     }
 }
 
