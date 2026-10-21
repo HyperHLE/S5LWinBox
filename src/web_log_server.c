@@ -1,4 +1,4 @@
-﻿#include "web_log_server.h"
+#include "web_log_server.h"
 #include "engine.h"
 #include "VMButtonQueue.h"
 
@@ -915,10 +915,9 @@ static void handle_client_request(socket_t fd, int slot)
         }
         char new_id[64] = {0};
         char detail[256] = {0};
-        bool opts[VM_INSTANCE_OPTION_MAX] = {false};
         int rc = -1;
         if (s_engine) {
-            rc = engine_machine_create(s_engine, name, opts, 0, disk, new_id, sizeof new_id, detail, sizeof detail);
+            rc = engine_machine_create(s_engine, name, NULL, 0, disk, new_id, sizeof new_id, detail, sizeof detail);
         }
         char body[256];
         int body_len = snprintf(body, sizeof body, "{\"ok\":%s,\"id\":\"%s\",\"detail\":\"%s\"}", rc == 0 ? "true" : "false", new_id, detail);

@@ -364,8 +364,7 @@ bool ui_handle_event(ui_state_t *ui, engine_t *engine, const SDL_Event *ev,
                     /* Confirm create */
                     char new_id[64] = {0};
                     char detail[256] = {0};
-                    bool opts[VM_INSTANCE_OPTION_MAX] = {false};
-                    int rc = engine_machine_create(engine, ui->new_machine_name, opts, 0,
+                    int rc = engine_machine_create(engine, ui->new_machine_name, NULL, 0,
                                                    ui->new_machine_disk_gib, new_id,
                                                    sizeof(new_id), detail, sizeof(detail));
                     if (rc == 0) {
@@ -461,8 +460,7 @@ bool ui_handle_event(ui_state_t *ui, engine_t *engine, const SDL_Event *ev,
                 } else if (mx >= btn_ok.x && mx < btn_ok.x + btn_ok.w && my >= btn_ok.y && my < btn_ok.y + btn_ok.h) {
                     char new_id[64] = {0};
                     char detail[256] = {0};
-                    bool opts[VM_INSTANCE_OPTION_MAX] = {false};
-                    int rc = engine_machine_create(engine, ui->new_machine_name, opts, 0,
+                    int rc = engine_machine_create(engine, ui->new_machine_name, NULL, 0,
                                                    ui->new_machine_disk_gib, new_id,
                                                    sizeof(new_id), detail, sizeof(detail));
                     if (rc == 0) {
