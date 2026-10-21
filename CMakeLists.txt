@@ -12,17 +12,25 @@ if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
-# Boost detection for Dynarmic on Windows CI runners
-if(WIN32)
-    if(NOT DEFINED BOOST_ROOT AND NOT DEFINED ENV{BOOST_ROOT})
-        file(GLOB BOOST_HOSTED "C:/hostedtoolcache/windows/Boost/*/*")
-        if(BOOST_HOSTED)
-            list(GET BOOST_HOSTED -1 BOOST_LATEST)
-            set(ENV{BOOST_ROOT} "${BOOST_LATEST}")
-            set(BOOST_ROOT "${BOOST_LATEST}" CACHE PATH "" FORCE)
-            message(STATUS "Auto-detected BOOST_ROOT: ${BOOST_ROOT}")
-        endif()
-    endif()
+# Boost headers via FetchContent for Dynarmic
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 OLD)
+endif()
+
+include(FetchContent)
+FetchContent_Declare(
+    boost
+    GIT_REPOSITORY https://github.com/Vita3K/ext-boost.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(boost)
+if(NOT boost_POPULATED)
+    FetchContent_Populate(boost)
+    set(BOOST_ROOT "${boost_SOURCE_DIR}" CACHE PATH "" FORCE)
+    set(Boost_INCLUDE_DIR "${boost_SOURCE_DIR}" CACHE PATH "" FORCE)
+    set(ENV{BOOST_ROOT} "${boost_SOURCE_DIR}")
+    message(STATUS "Self-contained Boost populated at: ${boost_SOURCE_DIR}")
 endif()
 
 # Dynarmic A32 JIT configuration
