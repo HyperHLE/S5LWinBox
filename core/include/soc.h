@@ -21,6 +21,10 @@
 #include "arm.h"
 #include "arm_ram_watch.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ------------------------------------------------------------ memory map
  *
  * CONFIRMED from the shipped device tree (firmware/devicetree.bin, iPhone1,2
@@ -5139,5 +5143,9 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status);
  * of guest state or a snapshot. */
 uint64_t s5l8900_interpreter_tick_batches(const s5l8900_t *m);
 uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* S5LBOX_SOC_H */

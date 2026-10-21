@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* CPSR condition-flag bit positions. */
 #define ARM_CPSR_N (1u << 31) /* Negative */
 #define ARM_CPSR_Z (1u << 30) /* Zero     */
@@ -706,5 +710,9 @@ arm_status_t arm_step(arm_cpu_t *cpu);
 
 /* Evaluate an ARM 4-bit condition field against the current flags. */
 bool arm_cond_passed(const arm_cpu_t *cpu, uint32_t cond);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* S5LBOX_ARM_H */
