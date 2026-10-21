@@ -87,8 +87,10 @@ if(NOT WIN32 AND NOT APPLE)
     target_link_libraries(emucore PUBLIC m)
 endif()
 
-if(NOT MSVC)
-    target_compile_options(emucore PRIVATE -Wall -Wextra)
+if(MSVC)
+    target_compile_options(emucore PRIVATE /O2 /Oi /Ot /Oy /GF /Gy)
+else()
+    target_compile_options(emucore PRIVATE -Wall -Wextra -O3 -fomit-frame-pointer)
     # VFPv2 has no fused multiply-add: VMLA rounds the product and then rounds
     # the sum. GCC's default -ffp-contract=fast is allowed to fuse those into
     # one FMA, which differs from hardware in the last bit. vfp.c also anchors

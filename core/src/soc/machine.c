@@ -2476,8 +2476,7 @@ static unsigned run_retirement_batch_limit(const s5l8900_t *m,
 static unsigned interpreter_tick_batch_limit(const s5l8900_t *m,
                                               unsigned remaining,
                                               bool active_clock) {
-    if ((m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
-        m->pre_step_hook)
+    if ((m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR)
         return 0u;
 #if defined(S5LBOX_STATIC_A64_ENGINE)
     if (s5l8900_static_a64_is_enabled(m)) return 0u;
@@ -2963,7 +2962,8 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
                 if (st != ARM_OK) break;
                 retired++;
                 if (m->level_dirty || ext_inputs(m) != m->ext_seen ||
-                    (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR)
+                    (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
+                    (m->pre_step_hook && pre_step_target_matches(m, m->cpu.r[15])))
                     break;
             } while (retired < limit);
 

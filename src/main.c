@@ -387,6 +387,17 @@ int main(int argc, char *argv[])
             const char *prep_ptr = strstr(status_json, "\"preparing\":true");
             const char *pdone_ptr = strstr(status_json, "\"prepareDone\":");
             const char *ptot_ptr = strstr(status_json, "\"prepareTotal\":");
+            const char *ret_ptr = strstr(status_json, "\"retired\":");
+
+            uint64_t retired = ret_ptr ? strtoull(ret_ptr + 10, NULL, 10) : 0;
+            char ret_str[32];
+            if (retired >= 1000000000ULL) {
+                snprintf(ret_str, sizeof ret_str, "%.2fG", (double)retired / 1e9);
+            } else if (retired >= 1000000ULL) {
+                snprintf(ret_str, sizeof ret_str, "%.1fM", (double)retired / 1e6);
+            } else {
+                snprintf(ret_str, sizeof ret_str, "%llu", (unsigned long long)retired);
+            }
 
             if (prep_ptr) {
                 uint64_t done = pdone_ptr ? strtoull(pdone_ptr + 14, NULL, 10) : 0;
@@ -396,7 +407,11 @@ int main(int argc, char *argv[])
             } else if (ready_ptr) {
                 double cur_fps = fps_ptr ? atof(fps_ptr + 6) : 0.0;
                 double cur_mips = rate_ptr ? atof(rate_ptr + 7) : 0.0;
-                snprintf(title, sizeof title, "S5LWinBox — [FPS: %.1f | MIPS: %.1f] | Inspector: http://localhost:%u", cur_fps, cur_mips, log_port);
+                if (cur_mips < 0.05) {
+                    snprintf(title, sizeof title, "S5LWinBox — [Сон / Standby: нажмите Esc или F1] | Инструкций: %s | Inspector: http://localhost:%u", ret_str, log_port);
+                } else {
+                    snprintf(title, sizeof title, "S5LWinBox — [FPS: %.1f | MIPS: %.1f | Инструкций: %s] | Inspector: http://localhost:%u", cur_fps, cur_mips, ret_str, log_port);
+                }
             } else {
                 snprintf(title, sizeof title, "S5LWinBox — [Ожидание IPSW: перетащите .ipsw в окно] | Inspector: http://localhost:%u", log_port);
             }
