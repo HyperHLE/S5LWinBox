@@ -116,6 +116,10 @@ int engine_snapshot_delete(engine_t *engine, const char *id,
                            const char *snapshot_id,
                            char *detail, size_t detail_capacity);
 
+/* -------------------------------------------------------------------- JIT */
+void engine_set_jit_enabled(engine_t *engine, bool enabled);
+bool engine_is_jit_enabled(const engine_t *engine);
+
 #ifdef __cplusplus
 }
 #endif
