@@ -26,18 +26,12 @@ public:
     uint32_t abort_far = 0;
     uint32_t abort_fsr = 0;
 
-    bool code_abort_taken = false;
-    uint32_t code_abort_far = 0;
-    uint32_t code_abort_fsr = 0;
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
         uint32_t pa = 0;
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
         uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_FETCH, priv, &pa);
         if (fsr != 0) {
-            code_abort_taken = true;
-            code_abort_far = vaddr;
-            code_abort_fsr = fsr;
             return std::nullopt;
         }
 
@@ -252,7 +246,6 @@ struct dynarmic_jit {
     std::unique_ptr<Dynarmic::ExclusiveMonitor> monitor;
     std::unique_ptr<Dynarmic::A32::Jit> jit;
     uint32_t last_ttbr0 = 0;
-    uint32_t last_context_id = 0;
 };
 
 extern "C" dynarmic_jit_t *dynarmic_jit_create(s5l8900_t *machine) {
@@ -282,7 +275,6 @@ extern "C" dynarmic_jit_t *dynarmic_jit_create(s5l8900_t *machine) {
     }
 
     state->last_ttbr0 = machine->cpu.cp15.ttbr0;
-    state->last_context_id = machine->cpu.cp15.context_id;
 
     return state.release();
 }
@@ -310,11 +302,9 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
     auto& jit = *jit_wrapper->jit;
     auto& cb = *jit_wrapper->callbacks;
 
-    if (machine->cpu.cp15.ttbr0 != jit_wrapper->last_ttbr0 ||
-        machine->cpu.cp15.context_id != jit_wrapper->last_context_id) {
+    if (machine->cpu.cp15.ttbr0 != jit_wrapper->last_ttbr0) {
         jit.ClearCache();
         jit_wrapper->last_ttbr0 = machine->cpu.cp15.ttbr0;
-        jit_wrapper->last_context_id = machine->cpu.cp15.context_id;
     }
 
     auto& regs = jit.Regs();
@@ -328,7 +318,6 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
     cb.ticks_executed = 0;
     cb.svc_taken = false;
     cb.abort_taken = false;
-    cb.code_abort_taken = false;
 
     jit.ClearHalt(Dynarmic::HaltReason::UserDefined1 |
                   Dynarmic::HaltReason::UserDefined2 |
@@ -352,15 +341,6 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
 
         uint32_t fault_pc = regs[15];
         arm_take_data_abort_ex(&machine->cpu, fault_pc, cb.abort_far, cb.abort_fsr);
-    } else if (cb.code_abort_taken) {
-        cb.code_abort_taken = false;
-        for (int i = 0; i < 15; ++i) machine->cpu.r[i] = regs[i];
-        machine->cpu.cpsr = jit.Cpsr();
-        for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
-        machine->cpu.vfp_fpscr = jit.Fpscr();
-
-        uint32_t fault_pc = cb.code_abort_far;
-        arm_take_prefetch_abort_ex(&machine->cpu, fault_pc, cb.code_abort_fsr);
     } else {
         for (int i = 0; i < 16; ++i) machine->cpu.r[i] = regs[i];
         machine->cpu.cpsr = jit.Cpsr();

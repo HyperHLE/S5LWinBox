@@ -106,6 +106,7 @@ struct engine {
     engine_stop_mode_t stop_mode;
     bool paused;
     bool machine_ready;
+    bool disable_jit;
     bool preparing_root;
     _Atomic bool abort_flag;
     _Atomic uint64_t prepare_done;
@@ -2254,9 +2255,11 @@ static bool install_payload(engine_t *e, s5l8900_t *machine,
             if (!s5l8900_init(machine, VM_GUEST_RAM_BASE, VM_GUEST_RAM_SIZE))
                 return false;
 #if defined(S5LBOX_DYNARMIC_JIT)
-            dynarmic_jit_t *jit = dynarmic_jit_create(machine);
-            if (jit) {
-                s5l8900_set_jit(machine, jit, &g_dynarmic_jit_ops);
+            if (!e->disable_jit) {
+                dynarmic_jit_t *jit = dynarmic_jit_create(machine);
+                if (jit) {
+                    s5l8900_set_jit(machine, jit, &g_dynarmic_jit_ops);
+                }
             }
 #endif
         } else {
@@ -2569,10 +2572,7 @@ static void engine_thread_main(engine_t *e)
     bool pause_active = false;
     uint64_t pause_started_ns = 0;
     bool audio_running = false;
-#if defined(__linux__)
-    bool startup_display_seen = false;
     bool startup_wake_sent = false;
-#endif
 
     if (!machine) {
         pthread_mutex_lock(&e->lock);
@@ -2596,12 +2596,16 @@ static void engine_thread_main(engine_t *e)
     }
 
 #if defined(S5LBOX_DYNARMIC_JIT)
-    dynarmic_jit_t *jit = dynarmic_jit_create(machine);
-    if (jit) {
-        s5l8900_set_jit(machine, jit, &g_dynarmic_jit_ops);
-        console_append(e, "[jit] Dynarmic A32 JIT compiler activated\n");
+    if (!e->disable_jit) {
+        dynarmic_jit_t *jit = dynarmic_jit_create(machine);
+        if (jit) {
+            s5l8900_set_jit(machine, jit, &g_dynarmic_jit_ops);
+            console_append(e, "[jit] Dynarmic A32 JIT compiler activated\n");
+        } else {
+            console_append(e, "[jit] Dynarmic JIT initialization failed; using interpreter\n");
+        }
     } else {
-        console_append(e, "[jit] Dynarmic JIT initialization failed; using interpreter\n");
+        console_append(e, "[jit] Dynarmic JIT disabled; using interpreter\n");
     }
 #endif
 
@@ -2700,10 +2704,7 @@ static void engine_thread_main(engine_t *e)
         drain_one_button(e, machine);
 
         retired += s5l8900_run(machine, ENGINE_CHUNK_INSTRUCTIONS, &status);
-#if defined(__linux__)
-        if (boot && s5l_clcd_running(&machine->clcd))
-            startup_display_seen = true;
-        if (boot && startup_display_seen && !startup_wake_sent &&
+        if (boot && !startup_wake_sent &&
             s5l8900_hibernation_ready(machine)) {
             bool queued_press = engine_button(e, VM_BUTTON_POWER, true);
             bool queued_release = queued_press &&
@@ -2715,7 +2716,6 @@ static void engine_thread_main(engine_t *e)
                     "waking the lock screen once\n");
             }
         }
-#endif
 
 
         if (s5l_pcf50635_in_standby(&machine->pmu)) {
@@ -2928,6 +2928,8 @@ engine_t *engine_create(const char *root_directory)
     mkdir_p(e->root);
     mkdir_p(e->firmware);
     mkdir_p(e->machines);
+    const char *no_jit_env = getenv("S5L_DISABLE_JIT");
+    e->disable_jit = (no_jit_env && (strcmp(no_jit_env, "1") == 0 || strcmp(no_jit_env, "true") == 0));
     load_instances(e);
     e->phase = PHASE_IDLE;
     snprintf(e->status, sizeof e->status, "idle");
@@ -3894,4 +3896,16 @@ int engine_usb_open(engine_t *engine, const char *service,
         snprintf(detail, detail_capacity,
                  "Virtual USB services are not connected in this build yet.");
     return -1;
+}
+
+void engine_set_jit_enabled(engine_t *e, bool enabled)
+{
+    if (e) {
+        e->disable_jit = !enabled;
+    }
+}
+
+bool engine_is_jit_enabled(const engine_t *e)
+{
+    return e ? !e->disable_jit : false;
 }

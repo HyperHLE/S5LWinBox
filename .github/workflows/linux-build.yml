@@ -2,9 +2,9 @@ name: Build S5LWinBox (Linux x64)
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: ["main", "master", "jit*"]
   pull_request:
-    branches: ["main", "master"]
+    branches: ["main", "master", "jit*"]
   workflow_dispatch:
 
 jobs:

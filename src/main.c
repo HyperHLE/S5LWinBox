@@ -100,12 +100,15 @@ int main(int argc, char *argv[])
     char root_dir[512];
     get_default_data_dir(root_dir, sizeof root_dir);
     char explicit_machine[64] = {0};
+    bool no_jit = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) {
             snprintf(root_dir, sizeof root_dir, "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--machine") && i + 1 < argc) {
             snprintf(explicit_machine, sizeof explicit_machine, "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--no-jit")) {
+            no_jit = true;
         }
     }
 
@@ -126,6 +129,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to create emulation engine\n");
         SDL_Quit();
         return 1;
+    }
+    if (no_jit) {
+        engine_set_jit_enabled(g_engine, false);
     }
     web_log_server_set_engine(g_engine);
 
