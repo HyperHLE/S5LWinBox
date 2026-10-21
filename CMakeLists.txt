@@ -111,6 +111,10 @@ else()
     target_compile_options(s5lwinbox PRIVATE -Wall -Wextra -Wno-unused-parameter -O3 -fomit-frame-pointer)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(s5lwinbox PRIVATE -static-libstdc++)
+endif()
+
 target_link_libraries(s5lwinbox PRIVATE
     ${S5L_SDL_TARGET}
     dynarmic
