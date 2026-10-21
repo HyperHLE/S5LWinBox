@@ -392,6 +392,7 @@ static void test_manifest_storage_may_alias_ram(void) {
                                              virtual_address);
     const size_t tail_offset = sizeof(guest_patch_entry_t) * 2u + 4u;
     uint8_t original_va_byte;
+    uint8_t expected_va_byte;
     guest_patch_report_t report;
     guest_patch_manifest_t manifest;
 
@@ -406,16 +407,16 @@ static void test_manifest_storage_may_alias_ram(void) {
         .replacement = {0x7cu}
     };
     original_va_byte = storage.bytes[second_va_offset];
+    expected_va_byte = (uint8_t)(original_va_byte ^ 0xffu);
     storage.entries[0].expected[0] = original_va_byte;
-    storage.entries[0].replacement[0] = (uint8_t)(original_va_byte ^ 0xffu);
+    storage.entries[0].replacement[0] = expected_va_byte;
 
     manifest = make_manifest(storage.bytes, sizeof(storage.bytes),
                              TEST_RAM_BASE, TEST_VIRT_BASE,
                              storage.entries, 2u);
     CHECK(guest_patch_apply(&manifest, &report) == GUEST_PATCH_STATUS_OK,
           "manifest aliasing RAM corrupted a later plan entry");
-    CHECK(storage.bytes[second_va_offset] ==
-              (uint8_t)(original_va_byte ^ 0xffu) &&
+    CHECK(storage.bytes[second_va_offset] == expected_va_byte &&
           storage.bytes[tail_offset] == 0x7cu,
           "aliased manifest patches were not both applied");
 }

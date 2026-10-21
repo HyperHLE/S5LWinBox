@@ -141,6 +141,16 @@ mod dyn_egl {
         fn GetProcAddress(hModule: *mut c_void, lpProcName: *const c_char) -> *mut c_void;
     }
 
+    #[cfg(target_os = "linux")]
+    #[link(name = "dl")]
+    extern "C" {
+        fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    #[cfg(target_os = "linux")]
+    const RTLD_NOW: i32 = 2;
+
     pub fn get_egl() -> Option<&'static EglLib> {
         static EGL: OnceLock<Option<EglLib>> = OnceLock::new();
         EGL.get_or_init(|| {
@@ -180,7 +190,41 @@ mod dyn_egl {
                     terminate: sym!("eglTerminate", FnTerminate),
                 })
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let mut h = dlopen(b"libEGL.so.1\0".as_ptr().cast(), RTLD_NOW);
+                if h.is_null() {
+                    h = dlopen(b"libEGL.so\0".as_ptr().cast(), RTLD_NOW);
+                }
+                if h.is_null() {
+                    return None;
+                }
+                macro_rules! sym {
+                    ($name:literal, $t:ty) => {{
+                        let p = dlsym(h, concat!($name, "\0").as_ptr().cast());
+                        if p.is_null() { return None; }
+                        std::mem::transmute::<*mut c_void, $t>(p)
+                    }};
+                }
+                Some(EglLib {
+                    get_display: sym!("eglGetDisplay", FnGetDisplay),
+                    initialize: sym!("eglInitialize", FnInitialize),
+                    bind_api: sym!("eglBindAPI", FnBindAPI),
+                    choose_config: sym!("eglChooseConfig", FnChooseConfig),
+                    create_context: sym!("eglCreateContext", FnCreateContext),
+                    create_window_surface: sym!("eglCreateWindowSurface", FnCreateWindowSurface),
+                    create_pbuffer_surface: sym!("eglCreatePbufferSurface", FnCreatePbufferSurface),
+                    destroy_surface: sym!("eglDestroySurface", FnDestroySurface),
+                    destroy_context: sym!("eglDestroyContext", FnDestroyContext),
+                    make_current: sym!("eglMakeCurrent", FnMakeCurrent),
+                    get_current_context: sym!("eglGetCurrentContext", FnGetCurrentContext),
+                    swap_buffers: sym!("eglSwapBuffers", FnSwapBuffers),
+                    get_proc_address: sym!("eglGetProcAddress", FnGetProcAddress),
+                    get_error: sym!("eglGetError", FnGetError),
+                    terminate: sym!("eglTerminate", FnTerminate),
+                })
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             None
         }).as_ref()
     }

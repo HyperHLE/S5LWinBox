@@ -117,6 +117,12 @@ const vm_option_t *vm_option_at(unsigned index);
 bool vm_option_new_machine_value(unsigned index, bool has_saved_value,
                                  bool saved_value);
 
+/* Desktop frontend defaults. Explicit saved values win. Linux starts new
+ * machines with MBX disabled and QuartzCore software rendering enabled; other
+ * platforms retain the product defaults above. */
+bool vm_option_new_desktop_machine_value(unsigned index, bool has_saved_value,
+                                         bool saved_value);
+
 /* Index of the row called `name`, or -1 for NULL and unknown names. */
 int vm_option_index(const char *name);
 

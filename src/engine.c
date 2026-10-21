@@ -3,6 +3,7 @@
  */
 #include "engine.h"
 #include "platform_compat.h"
+#include <SDL.h>
 
 #if !defined(_WIN32)
 #include <dirent.h>
@@ -69,6 +70,11 @@
 #define ENGINE_IMPORT_REPORT_CAP 4096u
 #define ENGINE_AUDIO_SCRATCH 1024u
 #define ENGINE_COW_HEADER_BYTES 28u
+
+static bool engine_new_machine_option_value(unsigned index)
+{
+    return vm_option_new_desktop_machine_value(index, false, false);
+}
 
 enum {
     PHASE_IDLE = 0,
@@ -575,7 +581,21 @@ static void init_hyperhle_gles(engine_t *e) {
         s_hyperhle_lib = S5L_DYNLIB_OPEN("libhyperhle_gles.dll");
     }
 #else
-    s_hyperhle_lib = S5L_DYNLIB_OPEN("libhyperhle_gles.so");
+    char *base_path = SDL_GetBasePath();
+    if (base_path) {
+        static const char library_name[] = "libhyperhle_gles.so";
+        size_t path_size = strlen(base_path) + sizeof library_name;
+        char *library_path = (char *)malloc(path_size);
+        if (library_path) {
+            snprintf(library_path, path_size, "%s%s", base_path, library_name);
+            s_hyperhle_lib = S5L_DYNLIB_OPEN(library_path);
+            free(library_path);
+        }
+        SDL_free(base_path);
+    }
+    if (!s_hyperhle_lib) {
+        s_hyperhle_lib = S5L_DYNLIB_OPEN("libhyperhle_gles.so");
+    }
 #endif
     if (!s_hyperhle_lib) {
         ENGINE_LOG("hyperhle-gles: acceleration library not found, running software MBX3D");
@@ -1635,7 +1655,7 @@ int engine_machine_create(engine_t *engine, const char *name,
     for (i = 0; i < count; i++) {
         values[i] = options && i < option_count
                         ? options[i]
-                        : vm_option_new_machine_value(i, false, false);
+                        : engine_new_machine_option_value(i);
     }
 
     pthread_mutex_lock(&e->lock);
@@ -1977,7 +1997,7 @@ int engine_machine_options_json(engine_t *engine, const char *id,
                 found ? "true" : "false");
     for (i = 0; i < count; i++) {
         bool value = found ? (i < VM_INSTANCE_OPTION_MAX && instance.options[i])
-                           : vm_option_new_machine_value(i, false, false);
+                           : engine_new_machine_option_value(i);
         if (i) json_raw(&j, ",");
         json_raw(&j, value ? "true" : "false");
     }
@@ -2549,6 +2569,10 @@ static void engine_thread_main(engine_t *e)
     bool pause_active = false;
     uint64_t pause_started_ns = 0;
     bool audio_running = false;
+#if defined(__linux__)
+    bool startup_display_seen = false;
+    bool startup_wake_sent = false;
+#endif
 
     if (!machine) {
         pthread_mutex_lock(&e->lock);
@@ -2676,6 +2700,23 @@ static void engine_thread_main(engine_t *e)
         drain_one_button(e, machine);
 
         retired += s5l8900_run(machine, ENGINE_CHUNK_INSTRUCTIONS, &status);
+#if defined(__linux__)
+        if (boot && s5l_clcd_running(&machine->clcd))
+            startup_display_seen = true;
+        if (boot && startup_display_seen && !startup_wake_sent &&
+            s5l8900_hibernation_ready(machine)) {
+            bool queued_press = engine_button(e, VM_BUTTON_POWER, true);
+            bool queued_release = queued_press &&
+                engine_button(e, VM_BUTTON_POWER, false);
+            if (queued_press && queued_release) {
+                startup_wake_sent = true;
+                console_append(e,
+                    "[vm] initial firmware boot reached sleep; "
+                    "waking the lock screen once\n");
+            }
+        }
+#endif
+
 
         if (s5l_pcf50635_in_standby(&machine->pmu)) {
             stopped_by_request = true;
@@ -2976,7 +3017,7 @@ int engine_start(engine_t *engine, const char *instance_id,
         if (e->option_count > VM_INSTANCE_OPTION_MAX)
             e->option_count = VM_INSTANCE_OPTION_MAX;
         for (i = 0; i < e->option_count; i++)
-            e->options[i] = vm_option_new_machine_value(i, false, false);
+            e->options[i] = engine_new_machine_option_value(i);
     }
 
     e->stop_requested = false;

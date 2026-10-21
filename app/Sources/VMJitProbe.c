@@ -8,6 +8,9 @@
  * without extensions, so they are not declared unless this is asked for
  * first. Must precede every include. */
 #if defined(__unix__) || defined(__APPLE__)
+#  if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#    define _DEFAULT_SOURCE 1
+#  endif
 #  ifndef _POSIX_C_SOURCE
 #    define _POSIX_C_SOURCE 200809L
 #  endif
@@ -26,8 +29,8 @@
 #  include <signal.h>
 #  include <sys/mman.h>
 #  include <unistd.h>
-/* BSD and Darwin spell it MAP_ANON; Linux spells it MAP_ANONYMOUS and only
- * defines the short form under _BSD_SOURCE. Accept whichever exists. */
+/* BSD and Darwin spell it MAP_ANON; Linux spells it MAP_ANONYMOUS. Accept
+ * whichever exists, with _DEFAULT_SOURCE set above so glibc exposes it. */
 #  if !defined(MAP_ANON) && defined(MAP_ANONYMOUS)
 #    define MAP_ANON MAP_ANONYMOUS
 #  endif
