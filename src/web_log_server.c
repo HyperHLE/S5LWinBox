@@ -1,4 +1,6 @@
-#include "web_log_server.h"
+﻿#include "web_log_server.h"
+#include "engine.h"
+#include "VMButtonQueue.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,7 +68,7 @@ static const char HTML_PAGE[] =
 "<head>\n"
 "<meta charset=\"UTF-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-"<title>S5LWinBox &bull; Live Inspector</title>\n"
+"<title>S5LWinBox / S5LPCBox &bull; Web Inspector & Manager</title>\n"
 "<style>\n"
 "* { box-sizing: border-box; margin: 0; padding: 0; }\n"
 "body {\n"
@@ -80,7 +82,7 @@ static const char HTML_PAGE[] =
 "header {\n"
 "  background: #161b22;\n"
 "  border-bottom: 1px solid #30363d;\n"
-"  padding: 10px 16px;\n"
+"  padding: 8px 16px;\n"
 "  display: flex;\n"
 "  align-items: center;\n"
 "  justify-content: space-between;\n"
@@ -105,14 +107,37 @@ static const char HTML_PAGE[] =
 "}\n"
 ".badge.live { background: #238636; color: #fff; }\n"
 ".badge.reconn { background: #d29922; color: #000; }\n"
+".nav-tabs {\n"
+"  display: flex;\n"
+"  gap: 4px;\n"
+"  background: #0d1117;\n"
+"  padding: 3px;\n"
+"  border-radius: 6px;\n"
+"  border: 1px solid #30363d;\n"
+"}\n"
+".tab-btn {\n"
+"  background: transparent;\n"
+"  color: #8b949e;\n"
+"  border: none;\n"
+"  padding: 5px 12px;\n"
+"  border-radius: 4px;\n"
+"  font-size: 0.82rem;\n"
+"  font-weight: 600;\n"
+"  cursor: pointer;\n"
+"  transition: all 0.15s;\n"
+"}\n"
+".tab-btn:hover { color: #c9d1d9; }\n"
+".tab-btn.active { background: #1f6feb; color: #fff; }\n"
 ".stats-bar {\n"
 "  display: flex;\n"
 "  align-items: center;\n"
-"  gap: 16px;\n"
+"  gap: 14px;\n"
 "  font-size: 0.82rem;\n"
 "  color: #8b949e;\n"
 "}\n"
 ".stat-item strong { color: #58a6ff; font-weight: 600; }\n"
+".tab-pane { display: none; flex: 1; flex-direction: column; overflow: hidden; }\n"
+".tab-pane.active { display: flex; }\n"
 ".toolbar {\n"
 "  background: #161b22;\n"
 "  border-bottom: 1px solid #30363d;\n"
@@ -139,7 +164,6 @@ static const char HTML_PAGE[] =
 "  font-size: 0.8rem;\n"
 "  font-weight: 500;\n"
 "  cursor: pointer;\n"
-"  transition: all 0.15s;\n"
 "}\n"
 ".filter-btn:hover { color: #c9d1d9; }\n"
 ".filter-btn.active { background: #1f6feb; color: #fff; }\n"
@@ -166,6 +190,10 @@ static const char HTML_PAGE[] =
 "  cursor: pointer;\n"
 "}\n"
 ".action-btn:hover { background: #30363d; border-color: #8b949e; }\n"
+".action-btn.primary { background: #238636; color: #fff; border-color: #2ea043; }\n"
+".action-btn.primary:hover { background: #2ea043; }\n"
+".action-btn.danger { background: #da3633; color: #fff; border-color: #f85149; }\n"
+".action-btn.danger:hover { background: #f85149; }\n"
 "#log-container {\n"
 "  flex: 1;\n"
 "  overflow-y: auto;\n"
@@ -174,12 +202,7 @@ static const char HTML_PAGE[] =
 "  font-size: 0.8rem;\n"
 "  line-height: 1.45;\n"
 "}\n"
-".log-row {\n"
-"  display: flex;\n"
-"  padding: 1px 4px;\n"
-"  border-radius: 3px;\n"
-"  word-break: break-all;\n"
-"}\n"
+".log-row { display: flex; padding: 1px 4px; border-radius: 3px; word-break: break-all; }\n"
 ".log-row:hover { background: #161b22; }\n"
 ".log-time { color: #8b949e; min-width: 90px; flex-shrink: 0; user-select: none; }\n"
 ".log-cat {\n"
@@ -202,7 +225,27 @@ static const char HTML_PAGE[] =
 ".cat-warn    { background: #d2992222; color: #d29922; border: 1px solid #d2992255; }\n"
 ".cat-error   { background: #da363322; color: #f85149; border: 1px solid #da363355; }\n"
 ".log-msg { color: #c9d1d9; flex: 1; }\n"
-".log-row.panic .log-msg { color: #f85149; font-weight: 600; }\n"
+"/* Machine Manager */\n"
+".mm-wrapper { padding: 20px; overflow-y: auto; flex: 1; max-width: 900px; margin: 0 auto; width: 100%; }\n"
+".mm-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }\n"
+".mm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }\n"
+".m-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }\n"
+".m-card.is-running { border-color: #238636; box-shadow: 0 0 10px rgba(35,134,54,0.2); }\n"
+".m-header { display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: 1.05rem; }\n"
+".m-meta { font-size: 0.82rem; color: #8b949e; line-height: 1.5; font-family: monospace; }\n"
+".m-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 8px; }\n"
+"/* Remote Phone */\n"
+".remote-wrapper { display: flex; justify-content: center; align-items: center; padding: 24px; flex: 1; overflow-y: auto; }\n"
+".phone-body { background: #161b22; border: 2px solid #30363d; border-radius: 36px; padding: 24px; width: 320px; display: flex; flex-direction: column; align-items: center; gap: 16px; box-shadow: 0 12px 36px rgba(0,0,0,0.6); }\n"
+".phone-screen { width: 100%; height: 260px; background: #000; border-radius: 12px; border: 1px solid #21262d; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; text-align: center; gap: 10px; color: #8b949e; }\n"
+".phone-btn-row { display: flex; gap: 8px; width: 100%; justify-content: center; }\n"
+".phone-key { background: #21262d; border: 1px solid #30363d; color: #f0f6fc; border-radius: 8px; padding: 10px 14px; font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.1s; flex: 1; text-align: center; }\n"
+".phone-key:hover { background: #30363d; border-color: #58a6ff; }\n"
+".phone-key:active { background: #1f6feb; transform: translateY(1px); }\n"
+".home-btn { width: 62px; height: 62px; border-radius: 31px; background: #21262d; border: 2px solid #30363d; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.15s; }\n"
+".home-btn:hover { border-color: #58a6ff; background: #30363d; }\n"
+".home-btn:active { background: #1f6feb; transform: scale(0.96); }\n"
+".home-sq { width: 18px; height: 18px; border: 2px solid #c9d1d9; border-radius: 4px; }\n"
 "</style>\n"
 "</head>\n"
 "<body>\n"
@@ -211,31 +254,76 @@ static const char HTML_PAGE[] =
 "    <span>&#x1F4F1; S5LWinBox</span>\n"
 "    <span id=\"conn-badge\" class=\"badge reconn\">CONNECTING</span>\n"
 "  </div>\n"
+"  <div class=\"nav-tabs\">\n"
+"    <button class=\"tab-btn active\" onclick=\"switchTab('logs')\">&#x1F4CB; Logs</button>\n"
+"    <button class=\"tab-btn\" onclick=\"switchTab('machines')\">&#x1F4F1; Machines</button>\n"
+"    <button class=\"tab-btn\" onclick=\"switchTab('remote')\">&#x1F3AE; Remote</button>\n"
+"  </div>\n"
 "  <div class=\"stats-bar\">\n"
 "    <div class=\"stat-item\">FPS: <strong id=\"stat-fps\">0.0</strong></div>\n"
 "    <div class=\"stat-item\">MIPS: <strong id=\"stat-mips\">0.0</strong></div>\n"
 "    <div class=\"stat-item\">RETIRED: <strong id=\"stat-retired\">0</strong></div>\n"
-"    <div class=\"stat-item\">SPACE: <strong id=\"stat-space\">0x0</strong></div>\n"
 "    <div class=\"stat-item\">STATE: <strong id=\"stat-state\">idle</strong></div>\n"
 "  </div>\n"
 "</header>\n"
-"<div class=\"toolbar\">\n"
-"  <div class=\"filter-group\">\n"
-"    <button class=\"filter-btn active\" data-cat=\"all\">All</button>\n"
-"    <button class=\"filter-btn\" data-cat=\"kernel\">Kernel</button>\n"
-"    <button class=\"filter-btn\" data-cat=\"panic\">Panic</button>\n"
-"    <button class=\"filter-btn\" data-cat=\"hle\">HLE</button>\n"
-"    <button class=\"filter-btn\" data-cat=\"mbx\">MBX</button>\n"
-"    <button class=\"filter-btn\" data-cat=\"dyld\">dyld</button>\n"
+"\n"
+"<div id=\"tab-logs\" class=\"tab-pane active\">\n"
+"  <div class=\"toolbar\">\n"
+"    <div class=\"filter-group\">\n"
+"      <button class=\"filter-btn active\" data-cat=\"all\">All</button>\n"
+"      <button class=\"filter-btn\" data-cat=\"kernel\">Kernel</button>\n"
+"      <button class=\"filter-btn\" data-cat=\"panic\">Panic</button>\n"
+"      <button class=\"filter-btn\" data-cat=\"hle\">HLE</button>\n"
+"      <button class=\"filter-btn\" data-cat=\"mbx\">MBX</button>\n"
+"      <button class=\"filter-btn\" data-cat=\"dyld\">dyld</button>\n"
+"    </div>\n"
+"    <input type=\"text\" id=\"search-box\" class=\"search-input\" placeholder=\"Filter logs...\">\n"
+"    <button id=\"btn-autoscroll\" class=\"action-btn active\">Auto-scroll: ON</button>\n"
+"    <button id=\"btn-clear\" class=\"action-btn\">Clear</button>\n"
+"    <a href=\"/log.txt\" download=\"s5lwinbox_log.txt\" style=\"text-decoration:none;\">\n"
+"      <button class=\"action-btn\">Export Log</button>\n"
+"    </a>\n"
 "  </div>\n"
-"  <input type=\"text\" id=\"search-box\" class=\"search-input\" placeholder=\"Filter logs...\">\n"
-"  <button id=\"btn-autoscroll\" class=\"action-btn active\">Auto-scroll: ON</button>\n"
-"  <button id=\"btn-clear\" class=\"action-btn\">Clear</button>\n"
-"  <a href=\"/log.txt\" download=\"s5lwinbox_log.txt\" style=\"text-decoration:none;\">\n"
-"    <button class=\"action-btn\">Export Log</button>\n"
-"  </a>\n"
+"  <div id=\"log-container\"></div>\n"
 "</div>\n"
-"<div id=\"log-container\"></div>\n"
+"\n"
+"<div id=\"tab-machines\" class=\"tab-pane\">\n"
+"  <div class=\"mm-wrapper\">\n"
+"    <div class=\"mm-top\">\n"
+"      <h2>Virtual Machines</h2>\n"
+"      <button class=\"action-btn primary\" onclick=\"promptCreateMachine()\">+ Create Machine</button>\n"
+"    </div>\n"
+"    <div id=\"mm-grid\" class=\"mm-grid\">Loading machines...</div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<div id=\"tab-remote\" class=\"tab-pane\">\n"
+"  <div class=\"remote-wrapper\">\n"
+"    <div class=\"phone-body\">\n"
+"      <div class=\"phone-btn-row\">\n"
+"        <button class=\"phone-key\" onclick=\"btnAction('power')\">&#x23FB; Power</button>\n"
+"        <button class=\"phone-key\" onclick=\"btnAction('mute')\">&#x1F515; Mute</button>\n"
+"      </div>\n"
+"      <div class=\"phone-screen\">\n"
+"        <h3 id=\"remote-m-name\" style=\"color:#f0f6fc;\">iPhone 3G</h3>\n"
+"        <p id=\"remote-status-text\">State: Running</p>\n"
+"        <p id=\"remote-stats-detail\" style=\"font-size:0.8rem;\">MIPS: 22.0 | FPS: 60.0</p>\n"
+"      </div>\n"
+"      <div class=\"phone-btn-row\">\n"
+"        <button class=\"phone-key\" onclick=\"btnAction('voldown')\">&#x1F509; Vol -</button>\n"
+"        <button class=\"phone-key\" onclick=\"btnAction('volup')\">&#x1F50A; Vol +</button>\n"
+"      </div>\n"
+"      <div class=\"phone-btn-row\">\n"
+"        <button class=\"phone-key\" onclick=\"btnAction('pause')\">&#x23F8; Pause</button>\n"
+"        <button class=\"phone-key\" onclick=\"btnAction('reset')\">&#x1F504; Reboot</button>\n"
+"      </div>\n"
+"      <div class=\"home-btn\" onclick=\"btnAction('home')\">\n"
+"        <div class=\"home-sq\"></div>\n"
+"      </div>\n"
+"    </div>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
 "<script>\n"
 "let autoScroll = true;\n"
 "let activeFilter = 'all';\n"
@@ -247,8 +335,68 @@ static const char HTML_PAGE[] =
 "const statFps = document.getElementById('stat-fps');\n"
 "const statMips = document.getElementById('stat-mips');\n"
 "const statRetired = document.getElementById('stat-retired');\n"
-"const statSpace = document.getElementById('stat-space');\n"
 "const statState = document.getElementById('stat-state');\n"
+"\n"
+"function switchTab(name) {\n"
+"  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));\n"
+"  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));\n"
+"  event.target.classList.add('active');\n"
+"  document.getElementById('tab-' + name).classList.add('active');\n"
+"  if (name === 'machines') loadMachines();\n"
+"}\n"
+"\n"
+"async function btnAction(btn) {\n"
+"  try {\n"
+"    await fetch('/api/button?btn=' + btn);\n"
+"  } catch(e) {}\n"
+"}\n"
+"\n"
+"async function loadMachines() {\n"
+"  const grid = document.getElementById('mm-grid');\n"
+"  try {\n"
+"    const res = await fetch('/api/machines');\n"
+"    const data = await res.json();\n"
+"    if (!data.machines || data.machines.length === 0) {\n"
+"      grid.innerHTML = '<p>No machines found.</p>';\n"
+"      return;\n"
+"    }\n"
+"    grid.innerHTML = data.machines.map(m => {\n"
+"      const isRun = (m.id === data.runningId);\n"
+"      return `<div class=\"m-card ${isRun ? 'is-running' : ''}\">` +\n"
+"        `<div class=\"m-header\"><span>${m.name}</span>` +\n"
+"        `<span class=\"badge ${isRun ? 'live' : 'reconn'}\">${isRun ? 'RUNNING' : 'IDLE'}</span></div>` +\n"
+"        `<div class=\"m-meta\">ID: ${m.id}<br>Disk: ${m.diskGiB}GB<br>Retired: ${(m.retiredTotal/1e6).toFixed(1)}M</div>` +\n"
+"        `<div class=\"m-actions\">` +\n"
+"        `<button class=\"action-btn primary\" onclick=\"startMachine('${m.id}')\">${isRun ? 'Restart' : 'Boot'}</button>` +\n"
+"        `${isRun ? `<button class=\"action-btn danger\" onclick=\"stopMachine()\">Stop</button>` : `<button class=\"action-btn danger\" onclick=\"deleteMachine('${m.id}')\">Delete</button>`}` +\n"
+"        `</div></div>`;\n"
+"    }).join('');\n"
+"  } catch(e) {\n"
+"    grid.innerHTML = '<p>Failed to load machines.</p>';\n"
+"  }\n"
+"}\n"
+"\n"
+"async function startMachine(id) {\n"
+"  await fetch('/api/machines/start?id=' + id);\n"
+"  setTimeout(loadMachines, 600);\n"
+"}\n"
+"async function stopMachine() {\n"
+"  await fetch('/api/machines/stop');\n"
+"  setTimeout(loadMachines, 600);\n"
+"}\n"
+"async function deleteMachine(id) {\n"
+"  if (confirm('Delete machine ' + id + '?')) {\n"
+"    await fetch('/api/machines/delete?id=' + id);\n"
+"    setTimeout(loadMachines, 600);\n"
+"  }\n"
+"}\n"
+"async function promptCreateMachine() {\n"
+"  const name = prompt('Enter machine name:', 'iPhone 3G');\n"
+"  if (name) {\n"
+"    await fetch('/api/machines/create?name=' + encodeURIComponent(name) + '&disk=8');\n"
+"    setTimeout(loadMachines, 600);\n"
+"  }\n"
+"}\n"
 "\n"
 "btnAuto.onclick = () => {\n"
 "  autoScroll = !autoScroll;\n"
@@ -286,17 +434,14 @@ static const char HTML_PAGE[] =
 "  const row = document.createElement('div');\n"
 "  row.className = 'log-row' + (entry.cat === 'panic' ? ' panic' : '');\n"
 "  row.dataset.cat = entry.cat;\n"
-"  \n"
 "  const catClass = 'cat-' + entry.cat.toLowerCase();\n"
 "  row.innerHTML = `<span class=\"log-time\">${entry.time}</span>` +\n"
 "                  `<span class=\"log-cat ${catClass}\">${entry.cat.toUpperCase()}</span>` +\n"
 "                  `<span class=\"log-msg\"></span>`;\n"
 "  row.querySelector('.log-msg').textContent = entry.msg;\n"
-"  \n"
 "  const catMatch = (activeFilter === 'all' || entry.cat === activeFilter);\n"
 "  const textMatch = (!filterText || row.textContent.toLowerCase().includes(filterText));\n"
 "  row.style.display = (catMatch && textMatch) ? 'flex' : 'none';\n"
-"  \n"
 "  container.appendChild(row);\n"
 "  if (container.children.length > 5000) {\n"
 "    container.removeChild(container.firstChild);\n"
@@ -331,9 +476,18 @@ static const char HTML_PAGE[] =
 "      const s = await res.json();\n"
 "      if (s.fps !== undefined) statFps.textContent = s.fps.toFixed(1);\n"
 "      if (s.mips !== undefined) statMips.textContent = s.mips.toFixed(1);\n"
-"      if (s.state !== undefined) statState.textContent = s.state;\n"
-"      if (s.retired !== undefined) statRetired.textContent = s.retired;\n"
-"      if (s.ttbr0 !== undefined) statSpace.textContent = s.ttbr0;\n"
+"      if (s.state !== undefined) {\n"
+"        statState.textContent = s.state;\n"
+"        const rText = document.getElementById('remote-status-text');\n"
+"        if (rText) rText.textContent = 'State: ' + s.state;\n"
+"      }\n"
+"      if (s.retired !== undefined) {\n"
+"        statRetired.textContent = (s.retired >= 1e9) ? (s.retired/1e9).toFixed(2)+'G' : (s.retired/1e6).toFixed(1)+'M';\n"
+"      }\n"
+"      const rDetail = document.getElementById('remote-stats-detail');\n"
+"      if (rDetail && s.mips !== undefined && s.fps !== undefined) {\n"
+"        rDetail.textContent = 'MIPS: ' + s.mips.toFixed(1) + ' | FPS: ' + s.fps.toFixed(1);\n"
+"      }\n"
 "    }\n"
 "  } catch (e) {}\n"
 "}\n"
@@ -356,6 +510,22 @@ static uint32_t s_count = 0u;
 static uint32_t s_seq = 0u;
 
 static client_t s_clients[MAX_CLIENTS];
+
+static engine_t *s_engine = NULL;
+
+void web_log_server_set_engine(struct engine *engine)
+{
+    s_engine = (engine_t *)engine;
+}
+
+static void s5l_sleep_ms(unsigned ms)
+{
+#if defined(_WIN32)
+    Sleep(ms);
+#else
+    usleep(ms * 1000u);
+#endif
+}
 
 /* Live status */
 static uint64_t s_status_retired = 0u;
@@ -655,6 +825,165 @@ static void handle_client_request(socket_t fd, int slot)
             "Content-Length: %d\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n", body_len);
+        (void)s5l_sock_send(fd, header, hlen);
+        (void)s5l_sock_send(fd, body, body_len);
+        s5l_sock_close(fd);
+        s_clients[slot].fd = S5L_INVALID_SOCKET;
+    } else if (strncmp(req, "GET /api/machines/start", 23) == 0 || strncmp(req, "POST /api/machines/start", 24) == 0) {
+        char id[64] = {0};
+        const char *p = strstr(req, "id=");
+        if (p) {
+            p += 3;
+            size_t i = 0;
+            while (p[i] && p[i] != ' ' && p[i] != '&' && p[i] != '\r' && p[i] != '\n' && i < sizeof(id) - 1) {
+                id[i] = p[i];
+                i++;
+            }
+            id[i] = '\0';
+        }
+        if (s_engine && id[0]) {
+            char detail[256] = {0};
+            engine_stop(s_engine, ENGINE_STOP_PLAIN);
+            engine_start(s_engine, id, detail, sizeof detail);
+        }
+        const char body[] = "{\"ok\":true}";
+        int body_len = (int)sizeof(body) - 1;
+        char header[256];
+        int hlen = snprintf(header, sizeof header,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", body_len);
+        (void)s5l_sock_send(fd, header, hlen);
+        (void)s5l_sock_send(fd, body, body_len);
+        s5l_sock_close(fd);
+        s_clients[slot].fd = S5L_INVALID_SOCKET;
+    } else if (strncmp(req, "GET /api/machines/stop", 22) == 0 || strncmp(req, "POST /api/machines/stop", 23) == 0) {
+        if (s_engine) {
+            engine_stop(s_engine, ENGINE_STOP_PLAIN);
+        }
+        const char body[] = "{\"ok\":true}";
+        int body_len = (int)sizeof(body) - 1;
+        char header[256];
+        int hlen = snprintf(header, sizeof header,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", body_len);
+        (void)s5l_sock_send(fd, header, hlen);
+        (void)s5l_sock_send(fd, body, body_len);
+        s5l_sock_close(fd);
+        s_clients[slot].fd = S5L_INVALID_SOCKET;
+    } else if (strncmp(req, "GET /api/machines/delete", 24) == 0 || strncmp(req, "POST /api/machines/delete", 25) == 0) {
+        char id[64] = {0};
+        const char *p = strstr(req, "id=");
+        if (p) {
+            p += 3;
+            size_t i = 0;
+            while (p[i] && p[i] != ' ' && p[i] != '&' && p[i] != '\r' && p[i] != '\n' && i < sizeof(id) - 1) {
+                id[i] = p[i];
+                i++;
+            }
+            id[i] = '\0';
+        }
+        char detail[256] = {0};
+        int rc = -1;
+        if (s_engine && id[0]) {
+            rc = engine_machine_delete(s_engine, id, detail, sizeof detail);
+        }
+        char body[256];
+        int body_len = snprintf(body, sizeof body, "{\"ok\":%s,\"detail\":\"%s\"}", rc == 0 ? "true" : "false", detail);
+        char header[256];
+        int hlen = snprintf(header, sizeof header,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", body_len);
+        (void)s5l_sock_send(fd, header, hlen);
+        (void)s5l_sock_send(fd, body, body_len);
+        s5l_sock_close(fd);
+        s_clients[slot].fd = S5L_INVALID_SOCKET;
+    } else if (strncmp(req, "GET /api/machines/create", 24) == 0 || strncmp(req, "POST /api/machines/create", 25) == 0) {
+        char name[64] = "iPhone 3G";
+        unsigned disk = 8;
+        const char *np = strstr(req, "name=");
+        if (np) {
+            np += 5;
+            size_t i = 0;
+            while (np[i] && np[i] != ' ' && np[i] != '&' && np[i] != '\r' && np[i] != '\n' && i < sizeof(name) - 1) {
+                if (np[i] == '+') name[i] = ' ';
+                else name[i] = np[i];
+                i++;
+            }
+            name[i] = '\0';
+        }
+        const char *dp = strstr(req, "disk=");
+        if (dp) {
+            disk = (unsigned)strtoul(dp + 5, NULL, 10);
+            if (disk != 2 && disk != 4 && disk != 8) disk = 8;
+        }
+        char new_id[64] = {0};
+        char detail[256] = {0};
+        bool opts[VM_INSTANCE_OPTION_MAX] = {false};
+        int rc = -1;
+        if (s_engine) {
+            rc = engine_machine_create(s_engine, name, opts, 0, disk, new_id, sizeof new_id, detail, sizeof detail);
+        }
+        char body[256];
+        int body_len = snprintf(body, sizeof body, "{\"ok\":%s,\"id\":\"%s\",\"detail\":\"%s\"}", rc == 0 ? "true" : "false", new_id, detail);
+        char header[256];
+        int hlen = snprintf(header, sizeof header,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", body_len);
+        (void)s5l_sock_send(fd, header, hlen);
+        (void)s5l_sock_send(fd, body, body_len);
+        s5l_sock_close(fd);
+        s_clients[slot].fd = S5L_INVALID_SOCKET;
+    } else if (strncmp(req, "GET /api/machines", 17) == 0) {
+        char body[8192];
+        int body_len = 0;
+        if (s_engine) {
+            body_len = engine_machines_json(s_engine, body, sizeof body);
+        }
+        if (body_len <= 0) {
+            body_len = snprintf(body, sizeof body, "{\"ok\":false,\"machines\":[]}");
+        }
+        char header[256];
+        int hlen = snprintf(header, sizeof header,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", body_len);
+        (void)s5l_sock_send(fd, header, hlen);
+        (void)s5l_sock_send(fd, body, body_len);
+        s5l_sock_close(fd);
+        s_clients[slot].fd = S5L_INVALID_SOCKET;
+    } else if (strncmp(req, "GET /api/button", 15) == 0 || strncmp(req, "POST /api/button", 16) == 0) {
+        if (s_engine) {
+            if (strstr(req, "btn=home")) {
+                engine_button(s_engine, VM_BUTTON_HOME, true);
+                s5l_sleep_ms(60);
+                engine_button(s_engine, VM_BUTTON_HOME, false);
+            } else if (strstr(req, "btn=power")) {
+                engine_button(s_engine, VM_BUTTON_POWER, true);
+                s5l_sleep_ms(60);
+                engine_button(s_engine, VM_BUTTON_POWER, false);
+            } else if (strstr(req, "btn=volup")) {
+                engine_button(s_engine, VM_BUTTON_VOLUME_UP, true);
+                s5l_sleep_ms(60);
+                engine_button(s_engine, VM_BUTTON_VOLUME_UP, false);
+            } else if (strstr(req, "btn=voldown")) {
+                engine_button(s_engine, VM_BUTTON_VOLUME_DOWN, true);
+                s5l_sleep_ms(60);
+                engine_button(s_engine, VM_BUTTON_VOLUME_DOWN, false);
+            } else if (strstr(req, "btn=mute")) {
+                static bool s_web_mute = false;
+                s_web_mute = !s_web_mute;
+                engine_button(s_engine, VM_BUTTON_RINGER_SILENT, s_web_mute);
+            } else if (strstr(req, "btn=pause")) {
+                static bool s_web_paused = false;
+                s_web_paused = !s_web_paused;
+                engine_set_paused(s_engine, s_web_paused);
+            } else if (strstr(req, "btn=reset")) {
+                char cur_id[64] = {0};
+                engine_get_or_create_default_machine(s_engine, cur_id, sizeof cur_id);
+                engine_stop(s_engine, ENGINE_STOP_PLAIN);
+                char detail[256] = {0};
+                engine_start(s_engine, cur_id, detail, sizeof detail);
+            }
+        }
+        const char body[] = "{\"ok\":true}";
+        int body_len = (int)sizeof(body) - 1;
+        char header[256];
+        int hlen = snprintf(header, sizeof header,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", body_len);
         (void)s5l_sock_send(fd, header, hlen);
         (void)s5l_sock_send(fd, body, body_len);
         s5l_sock_close(fd);

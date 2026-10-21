@@ -9,6 +9,9 @@
 extern "C" {
 #endif
 
+struct engine;
+void web_log_server_set_engine(struct engine *engine);
+
 /* Start web log server on preferred_port (tries up to preferred_port + 9 if busy).
  * Returns the actual port bound to, or 0 on failure. */
 uint16_t web_log_server_start(uint16_t preferred_port);

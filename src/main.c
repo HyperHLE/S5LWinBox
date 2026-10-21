@@ -9,6 +9,7 @@
  */
 
 #include "engine.h"
+#include "ui.h"
 #include "platform_compat.h"
 #include "web_log_server.h"
 #include "VMButtonQueue.h"
@@ -23,7 +24,7 @@
 #include <string.h>
 
 #define DEFAULT_WINDOW_WIDTH  640
-#define DEFAULT_WINDOW_HEIGHT 960
+#define DEFAULT_WINDOW_HEIGHT (960 + UI_TOOLBAR_HEIGHT)
 #define GUEST_SCREEN_WIDTH    320
 #define GUEST_SCREEN_HEIGHT   480
 #define AUDIO_SAMPLE_RATE     48000
@@ -123,6 +124,7 @@ int main(int argc, char *argv[])
         SDL_Quit();
         return 1;
     }
+    web_log_server_set_engine(g_engine);
 
     /* Start Web Inspector log server */
     uint16_t log_port = engine_get_web_log_port(g_engine);
@@ -208,6 +210,9 @@ int main(int argc, char *argv[])
         printf("Hotkeys: Esc=Home, F1=Power, F2/F3=Vol-/+, F5=Mute, F11=Fullscreen, Space=Pause\n\n");
     }
 
+    ui_state_t g_ui;
+    ui_init(&g_ui);
+
     bool running = true;
     bool fullscreen = false;
     uint32_t last_title_update = SDL_GetTicks();
@@ -217,11 +222,13 @@ int main(int argc, char *argv[])
         int win_w, win_h;
         SDL_GetWindowSize(window, &win_w, &win_h);
 
-        SDL_Rect vp;
-        float scale;
-        compute_viewport(win_w, win_h, &vp, &scale);
+        ui_layout(&g_ui, win_w, win_h);
 
         while (SDL_PollEvent(&ev)) {
+            if (ui_handle_event(&g_ui, g_engine, &ev, window, &running, &fullscreen)) {
+                continue;
+            }
+
             switch (ev.type) {
             case SDL_QUIT:
                 running = false;
@@ -268,8 +275,8 @@ int main(int argc, char *argv[])
             case SDL_MOUSEBUTTONDOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT) {
                     g_mouse_down = true;
-                    double gx = (double)(ev.button.x - vp.x) / (double)scale;
-                    double gy = (double)(ev.button.y - vp.y) / (double)scale;
+                    double gx = (double)(ev.button.x - g_ui.screen_rect.x) / (double)g_ui.screen_scale;
+                    double gy = (double)(ev.button.y - g_ui.screen_rect.y) / (double)g_ui.screen_scale;
                     if (gx >= 0.0 && gx < (double)GUEST_SCREEN_WIDTH &&
                         gy >= 0.0 && gy < (double)GUEST_SCREEN_HEIGHT) {
                         engine_touch(g_engine, gx, gy, (double)GUEST_SCREEN_WIDTH, (double)GUEST_SCREEN_HEIGHT, 0 /* BEGAN */);
@@ -279,8 +286,8 @@ int main(int argc, char *argv[])
 
             case SDL_MOUSEMOTION:
                 if (g_mouse_down) {
-                    double gx = (double)(ev.motion.x - vp.x) / (double)scale;
-                    double gy = (double)(ev.motion.y - vp.y) / (double)scale;
+                    double gx = (double)(ev.motion.x - g_ui.screen_rect.x) / (double)g_ui.screen_scale;
+                    double gy = (double)(ev.motion.y - g_ui.screen_rect.y) / (double)g_ui.screen_scale;
                     if (gx < 0.0) gx = 0.0;
                     if (gx >= (double)GUEST_SCREEN_WIDTH) gx = (double)(GUEST_SCREEN_WIDTH - 1);
                     if (gy < 0.0) gy = 0.0;
@@ -292,8 +299,8 @@ int main(int argc, char *argv[])
             case SDL_MOUSEBUTTONUP:
                 if (ev.button.button == SDL_BUTTON_LEFT && g_mouse_down) {
                     g_mouse_down = false;
-                    double gx = (double)(ev.button.x - vp.x) / (double)scale;
-                    double gy = (double)(ev.button.y - vp.y) / (double)scale;
+                    double gx = (double)(ev.button.x - g_ui.screen_rect.x) / (double)g_ui.screen_scale;
+                    double gy = (double)(ev.button.y - g_ui.screen_rect.y) / (double)g_ui.screen_scale;
                     if (gx < 0.0) gx = 0.0;
                     if (gx >= (double)GUEST_SCREEN_WIDTH) gx = (double)(GUEST_SCREEN_WIDTH - 1);
                     if (gy < 0.0) gy = 0.0;
@@ -323,6 +330,7 @@ int main(int argc, char *argv[])
                     if (pressed) {
                         static bool s_ringer_silent = false;
                         s_ringer_silent = !s_ringer_silent;
+                        g_ui.ringer_silent = s_ringer_silent;
                         engine_button(g_engine, VM_BUTTON_RINGER_SILENT, s_ringer_silent);
                     }
                     break;
@@ -336,6 +344,7 @@ int main(int argc, char *argv[])
                     if (pressed) {
                         static bool s_paused = false;
                         s_paused = !s_paused;
+                        g_ui.paused = s_paused;
                         engine_set_paused(g_engine, s_paused);
                     }
                     break;
@@ -370,7 +379,8 @@ int main(int argc, char *argv[])
         /* Render */
         SDL_SetRenderDrawColor(renderer, 10, 12, 16, 255);
         SDL_RenderClear(renderer);
-        SDL_RenderCopy(renderer, texture, NULL, &vp);
+        SDL_RenderCopy(renderer, texture, NULL, &g_ui.screen_rect);
+        ui_render(&g_ui, g_engine, renderer, win_w, win_h);
         SDL_RenderPresent(renderer);
 
         /* Status update twice per second */

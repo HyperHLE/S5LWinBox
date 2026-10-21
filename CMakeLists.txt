@@ -39,6 +39,7 @@ list(FILTER S5L_APP_SOURCES EXCLUDE REGEX "/VMFirmwareHLE\\.c$")
 
 add_executable(s5lwinbox
     src/main.c
+    src/ui.c
     src/engine.c
     src/engine_ipa.c
     src/web_log_server.c
