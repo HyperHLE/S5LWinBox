@@ -111,11 +111,11 @@ static void setup(void) {
 /* The signed AArch64 refill loads these fields directly. Exercise the same
  * layout guard on 64-bit non-ARM CI too, before an iPhone-only build catches it. */
 #if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
-_Static_assert(offsetof(arm_ram_window_t, read_host) == 120u &&
-               offsetof(arm_ram_window_t, write_host) == 128u &&
-               offsetof(arm_ram_window_t, base) == 136u &&
-               offsetof(arm_ram_window_t, bytes) == 140u &&
-               sizeof(arm_ram_window_t) == 144u, "native RAM window ABI");
+_Static_assert(offsetof(arm_ram_window_t, read_host) == 152u &&
+               offsetof(arm_ram_window_t, write_host) == 160u &&
+               offsetof(arm_ram_window_t, base) == 168u &&
+               offsetof(arm_ram_window_t, bytes) == 172u &&
+               sizeof(arm_ram_window_t) == 176u, "native RAM window ABI");
 #endif
 
 static void prepare_fetch_noop(void *ctx, uint32_t va, uint32_t pa, bool priv) {

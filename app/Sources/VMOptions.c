@@ -8,8 +8,8 @@
 #include <string.h>
 
 /* `def` remains the desktop baseline so equivalent command lines are exact.
- * Product defaults are resolved by vm_option_new_machine_value below, in both
- * the normal app and the separately identified MBX test app. */
+ * The app uses vm_option_new_machine_value for shared product defaults and
+ * vm_option_new_desktop_machine_value for the Linux renderer profile. */
 
 /* The reasons below are compressed from bootkernel's own help text. They are
  * kept to one sentence each because a table row is not a manual page, and they
@@ -17,10 +17,10 @@
  * against docs/BOOTLOG.md, "recommended" is not. */
 static const vm_option_t VM_OPTIONS[] = {
     { "mbx", "MBX graphics (experimental)  ·  /arm-io/mbx",
-      "On by default for new machines, paired with the CPU software renderer "
-      "off. Uses the emulated PowerVR reset, ring, 2D and 3D models. Still "
-      "experimental: undecoded submits may complete without pixels, and "
-      "original-device responsiveness is not established.",
+      "On by default for new machines on other platforms. Linux starts with MBX "
+      "off and the tested QuartzCore CPU renderer on so iOS 3.1.3 gets a "
+      "visible first boot. When enabled, this emulated PowerVR path remains "
+      "experimental: undecoded submits may complete without pixels.",
       false, VM_OPT_GROUP_HARDWARE, VM_OPT_IMPL_HARNESS },
     { "sha1", "SHA-1 engine  ·  /arm-io/sha1",
       "Off: matched, every 4096-byte cs_validate_page digest goes to an "
@@ -63,9 +63,9 @@ static const vm_option_t VM_OPTIONS[] = {
       "failure stays visible instead of costing a 30-second stall.",
       true, VM_OPT_GROUP_PATCH, VM_OPT_IMPL_HARNESS },
     { "ca-software-render", "QuartzCore software renderer",
-      "Off by default for new machines so QuartzCore uses MBX. CPU software "
-      "mode pairs this override on with MBX off. This is written when the "
-      "work image is made; changing it later cannot convert that image.",
+      "On by default for Linux desktop machines and paired with MBX off; other "
+      "platforms keep the MBX profile. This is written when the work image "
+      "is made; changing it later cannot convert that image.",
       true,
       VM_OPT_GROUP_PATCH, VM_OPT_IMPL_HARNESS },
 
@@ -198,6 +198,18 @@ bool vm_option_new_machine_value(unsigned index, bool has_saved_value,
         return true;
     if (!strcmp(option->name, "ca-software-render")) return false;
     return option->def;
+}
+
+bool vm_option_new_desktop_machine_value(unsigned index, bool has_saved_value,
+                                         bool saved_value) {
+    const vm_option_t *option = vm_option_at(index);
+    if (!option) return false;
+    if (has_saved_value) return saved_value;
+#if defined(__linux__)
+    if (!strcmp(option->name, "mbx")) return false;
+    if (!strcmp(option->name, "ca-software-render")) return true;
+#endif
+    return vm_option_new_machine_value(index, false, false);
 }
 
 int vm_option_index(const char *name) {

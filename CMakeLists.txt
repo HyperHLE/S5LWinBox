@@ -6,6 +6,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(S5LBOX_BUILD_HYPERHLE_GLES "Build the optional HyperHLE GLES backend when Cargo is available" ON)
+
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
@@ -13,7 +15,7 @@ endif()
 # Portable emulator core & support libraries
 add_subdirectory(core)
 
-# SDL2 via FetchContent (clean, self-contained, no external dev packages required)
+# SDL2 via FetchContent. Linux display and audio backends need their system development packages.
 include(FetchContent)
 FetchContent_Declare(
     SDL2
@@ -88,6 +90,45 @@ if(WIN32)
     target_link_libraries(s5lwinbox PRIVATE ws2_32)
 else()
     target_link_libraries(s5lwinbox PRIVATE m dl)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND S5LBOX_BUILD_HYPERHLE_GLES)
+    find_program(CARGO_EXECUTABLE NAMES cargo HINTS "$ENV{HOME}/.cargo/bin")
+    if(CARGO_EXECUTABLE)
+        set(HYPERHLE_GLES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rust/hyperhle-gles")
+        file(GLOB_RECURSE HYPERHLE_GLES_SOURCES CONFIGURE_DEPENDS
+            "${HYPERHLE_GLES_DIR}/src/*.rs"
+            "${HYPERHLE_GLES_DIR}/gl-bindings/*.rs"
+            "${HYPERHLE_GLES_DIR}/native/*.cpp"
+            "${HYPERHLE_GLES_DIR}/third_party/PVRTDecompress/*.cpp"
+            "${HYPERHLE_GLES_DIR}/third_party/PVRTDecompress/*.h"
+        )
+        list(APPEND HYPERHLE_GLES_SOURCES
+            "${HYPERHLE_GLES_DIR}/Cargo.toml"
+            "${HYPERHLE_GLES_DIR}/build.rs"
+            "${HYPERHLE_GLES_DIR}/gl-bindings/Cargo.toml"
+            "${HYPERHLE_GLES_DIR}/gl-bindings/build.rs"
+        )
+        if(EXISTS "${HYPERHLE_GLES_DIR}/Cargo.lock")
+            list(APPEND HYPERHLE_GLES_SOURCES "${HYPERHLE_GLES_DIR}/Cargo.lock")
+        endif()
+
+        add_custom_target(hyperhle_gles_linux
+            COMMAND "${CARGO_EXECUTABLE}" build --release --manifest-path "${HYPERHLE_GLES_DIR}/Cargo.toml"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${HYPERHLE_GLES_DIR}/target/release/libhyperhle_gles.so"
+                "$<TARGET_FILE_DIR:s5lwinbox>/libhyperhle_gles.so"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            DEPENDS ${HYPERHLE_GLES_SOURCES}
+            COMMENT "Building and staging HyperHLE GLES for Linux"
+            VERBATIM
+        )
+        add_dependencies(s5lwinbox hyperhle_gles_linux)
+    else()
+        message(STATUS "Cargo not found; S5LWinBox will use its software renderer")
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(STATUS "HyperHLE GLES is disabled; S5LWinBox will use its software renderer")
 endif()
 
 # Copy SDL2.dll and ANGLE DLLs next to executable on Windows
