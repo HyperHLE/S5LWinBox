@@ -131,28 +131,37 @@ def main():
     run_url = f"https://github.com/{repo}/actions/runs/{run_id}" if run_id else f"https://github.com/{repo}/actions"
     commit_url = f"https://github.com/{repo}/commit/{commit_sha}" if commit_sha else f"https://github.com/{repo}"
 
+    is_linux = sys.platform.startswith("linux")
+    platform_name = "Linux x64" if is_linux else "Windows x64"
+    icon = "🐧" if is_linux else "🖥️"
+    files_desc = (
+        "• <b>S5LWinBox Linux x64:</b> <code>s5lwinbox</code>, <code>libhyperhle_gles.so</code>\n\n"
+        if is_linux else
+        "• <b>S5LWinBox Windows x64:</b> <code>s5lwinbox.exe</code>, <code>SDL2.dll</code>, <code>hyperhle_gles.dll</code>\n\n"
+    )
+
     if status == "success":
         text = (
-            "✅ <b>Компиляция S5LWinBox успешно завершена!</b>\n\n"
+            f"✅ <b>Компиляция S5LWinBox ({platform_name}) успешно завершена!</b>\n\n"
             f"🌿 <b>Ветка:</b> <code>{html.escape(branch)}</code>\n"
             f'📌 <b>Коммит:</b> <a href="{commit_url}">{short_sha}</a> — <i>{first_line_esc}</i>\n'
             f"👤 <b>Автор:</b> {html.escape(actor)}\n"
             f'🔗 <b>Сборка:</b> <a href="{run_url}">GitHub Actions #{html.escape(str(run_number))}</a>\n\n'
             "📦 <b>Собранный архив:</b>\n"
-            "• <b>S5LWinBox Windows x64:</b> <code>s5lwinbox.exe</code>, <code>SDL2.dll</code>, <code>hyperhle_gles.dll</code>\n\n"
+            f"{files_desc}"
             "<i>Отправляю архив...</i>"
         )
         send_telegram_message(token, chat_id, thread_id, text)
 
         import glob
-        zip_files = glob.glob("dist/*.zip") + glob.glob("dist/*.7z")
+        zip_files = glob.glob("dist/*.zip") + glob.glob("dist/*.7z") + glob.glob("dist/*.tar.gz")
         for zf in zip_files:
             if os.path.isfile(zf):
                 size_mb = os.path.getsize(zf) / (1024 * 1024)
                 zname = os.path.basename(zf)
                 caption = (
-                    f"🖥️ <b>{html.escape(zname)}</b> ({size_mb:.1f} MB)\n"
-                    f"<b>Тип:</b> Windows x64 Portable (SDL2 + HyperHLE GLES)\n"
+                    f"{icon} <b>{html.escape(zname)}</b> ({size_mb:.1f} MB)\n"
+                    f"<b>Тип:</b> {platform_name} Portable\n"
                     f"🌿 <b>Ветка:</b> <code>{html.escape(branch)}</code>\n"
                     f'📌 <b>Коммит:</b> <a href="{commit_url}">{short_sha}</a>'
                 )
@@ -171,7 +180,7 @@ def main():
                     pass
         err_box = f"\n\n<b>CMake / Build Log:</b>\n<pre>{html.escape(cmake_err[-1200:])}</pre>" if cmake_err else ""
         text = (
-            "❌ <b>Ошибка при сборке S5LWinBox!</b>\n\n"
+            f"❌ <b>Ошибка при сборке S5LWinBox ({platform_name})!</b>\n\n"
             f"🌿 <b>Ветка:</b> <code>{html.escape(branch)}</code>\n"
             f'📌 <b>Коммит:</b> <a href="{commit_url}">{short_sha}</a> — <i>{first_line_esc}</i>\n'
             f"👤 <b>Автор:</b> {html.escape(actor)}\n"

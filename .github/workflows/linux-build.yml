@@ -61,3 +61,38 @@ jobs:
             grep -Fq "Web Log Inspector: http://localhost:8080" "$RUNNER_TEMP/s5lwinbox.log"
             grep -Fq "S5LWinBox / S5LPCBox &bull; Web Inspector & Manager" "$RUNNER_TEMP/inspector.html"
           '
+
+      - name: Assemble Release Package
+        run: |
+          mkdir -p dist package
+          cp build/s5lwinbox package/
+          if [ -f build/libhyperhle_gles.so ]; then
+            cp build/libhyperhle_gles.so package/
+          elif [ -f rust/hyperhle-gles/target/release/libhyperhle_gles.so ]; then
+            cp rust/hyperhle-gles/target/release/libhyperhle_gles.so package/
+          fi
+          cp README.md package/ || true
+          cp LICENSE package/ || true
+          tar -czvf dist/S5LWinBox-linux-x64.tar.gz -C package .
+          ls -lh dist/S5LWinBox-linux-x64.tar.gz
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: S5LWinBox-linux-x64
+          path: dist/S5LWinBox-linux-x64.tar.gz
+          retention-days: 14
+
+      - name: Notify Telegram
+        if: always()
+        env:
+          BUILD_STATUS: ${{ job.status }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          python3 tools/notify_telegram.py
