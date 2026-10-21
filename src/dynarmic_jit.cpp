@@ -103,7 +103,7 @@ public:
         machine->cpu.cpsr |= ARM_CPSR_I;
         machine->cpu.cpsr &= ~ARM_CPSR_T;
 
-        uint32_t vector = (machine->cpu.cp15.c1_sctlr & ARM_SCTLR_V) ? 0xFFFF0008u : 0x00000008u;
+        uint32_t vector = (machine->cpu.cp15.sctlr & ARM_SCTLR_V) ? 0xFFFF0008u : 0x00000008u;
         machine->cpu.r[15] = vector;
 
         if (machine->cpu.bus && machine->cpu.bus->user_svc_observer) {
@@ -158,7 +158,7 @@ private:
     T ReadMemory(Dynarmic::A32::VAddr vaddr) {
         uint32_t pa = 0;
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
-        uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_DATA, priv, &pa);
+        uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_READ, priv, &pa);
         if (fsr != 0) {
             machine->cpu.abort_pending = true;
             machine->cpu.abort_fsr = fsr;
@@ -265,8 +265,8 @@ extern "C" dynarmic_jit_t *dynarmic_jit_create(s5l8900_t *machine) {
     }
 
     state->last_tlb_flushes = machine->cpu.tlb_flushes;
-    state->last_ttbr0 = machine->cpu.cp15.c2_base0;
-    state->last_context_id = machine->cpu.cp15.c13_context;
+    state->last_ttbr0 = machine->cpu.cp15.ttbr0;
+    state->last_context_id = machine->cpu.cp15.context_id;
 
     return state.release();
 }
@@ -297,12 +297,12 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
     auto& cb = *jit_wrapper->callbacks;
 
     if (machine->cpu.tlb_flushes != jit_wrapper->last_tlb_flushes ||
-        machine->cpu.cp15.c2_base0 != jit_wrapper->last_ttbr0 ||
-        machine->cpu.cp15.c13_context != jit_wrapper->last_context_id) {
+        machine->cpu.cp15.ttbr0 != jit_wrapper->last_ttbr0 ||
+        machine->cpu.cp15.context_id != jit_wrapper->last_context_id) {
         jit.ClearCache();
         jit_wrapper->last_tlb_flushes = machine->cpu.tlb_flushes;
-        jit_wrapper->last_ttbr0 = machine->cpu.cp15.c2_base0;
-        jit_wrapper->last_context_id = machine->cpu.cp15.c13_context;
+        jit_wrapper->last_ttbr0 = machine->cpu.cp15.ttbr0;
+        jit_wrapper->last_context_id = machine->cpu.cp15.context_id;
     }
 
     auto& regs = jit.Regs();
