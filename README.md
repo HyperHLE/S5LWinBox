@@ -75,7 +75,7 @@ The inspector offers:
 
 ### Linux (Debian/Ubuntu)
 
-Prerequisites: CMake 3.22+, GCC or Clang, Rust stable/Cargo, and the SDL2 backend development packages below. CMake fetches SDL2; these packages enable X11/Wayland, EGL/OpenGL ES, and audio. The Linux executable statically links the GNU C++ runtime to avoid requiring a newer `libstdc++` than the host provides; SDL2, glibc, and display/audio system libraries remain runtime dependencies.
+Prerequisites: CMake 3.22+, GCC or Clang, Rust stable/Cargo, and the SDL2 backend development packages below. CMake fetches SDL2; these packages enable X11/Wayland, EGL/OpenGL ES, and audio. Linux release builds target the Ubuntu 22.04 / glibc 2.35 baseline and statically link the GNU C++ runtime, making them compatible with Debian 12 and newer; SDL2, glibc, and display/audio system libraries remain runtime dependencies.
 
 ```sh
 sudo apt-get install -y \

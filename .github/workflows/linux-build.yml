@@ -10,7 +10,7 @@ on:
 jobs:
   build:
     name: Build & Smoke Test Linux x64
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Check out repository
@@ -38,6 +38,23 @@ jobs:
 
       - name: Build S5LWinBox
         run: cmake --build build --target s5lwinbox --parallel 2
+
+      - name: Verify Debian 12 runtime baseline
+        run: |
+          python3 - <<'PY'
+          import re
+          import subprocess
+
+          binaries = ("build/s5lwinbox", "build/libhyperhle_gles.so")
+          limits = {"GLIBC_": (2, 35), "GLIBCXX_": (3, 4, 30)}
+          for binary in binaries:
+              info = subprocess.check_output(["readelf", "--version-info", binary], text=True)
+              for prefix, limit in limits.items():
+                  versions = [tuple(map(int, value.split("."))) for value in re.findall(re.escape(prefix) + r"([0-9]+(?:\.[0-9]+)+)", info)]
+                  newest = max(versions, default=(0,))
+                  if newest > limit:
+                      raise SystemExit(f"{binary} requires {prefix}{'.'.join(map(str, newest))}; supported baseline is {prefix}{'.'.join(map(str, limit))}")
+          PY
 
       - name: Smoke-test Linux GUI, GLES and Web Inspector
         env:
