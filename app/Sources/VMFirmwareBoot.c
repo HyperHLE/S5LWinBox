@@ -986,6 +986,13 @@ static bool recover_powered_off_work_image(
         vm_guest_install_status_t discarded =
             vm_guest_recovery_discard_stage(
                 paths->work, discard_detail, sizeof discard_detail);
+        if (counters_only) {
+            fprintf(stderr,
+                    "[rootfs] cold-boot safe clone skipped (%s): %s; proceeding with live disk\n",
+                    vm_guest_install_status_text(transaction_status),
+                    transaction_detail[0] ? transaction_detail : "insufficient disk space or I/O failure");
+            return true;
+        }
         (void)snprintf(
             detail, detail_capacity,
             "Powered-off filesystem recovery could not clone the live disk "
@@ -1023,16 +1030,12 @@ static bool recover_powered_off_work_image(
             return false;
         }
         fprintf(stderr,
-                "[rootfs] powered-off recovery skipped (%s at %s): %s\n",
+                "[rootfs] %s recovery skipped (%s at %s): %s\n",
+                counters_only ? "cold-boot" : "powered-off",
                 rootfs_work_status_name(repair_status),
                 rootfs_work_stage_name(repair.stage),
                 repair.detail[0] ? repair.detail
                                  : "the clone was not provably repairable");
-        if (counters_only) {
-            if (detail && detail_capacity) (void)snprintf(detail, detail_capacity,
-                "The guest disk could not be recovered safely. %.180s", repair.detail);
-            return false;
-        }
         return true;
     }
 

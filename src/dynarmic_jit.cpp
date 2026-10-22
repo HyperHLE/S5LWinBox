@@ -540,7 +540,6 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
         if (jit_wrapper->monitor) {
             jit_wrapper->monitor->ClearProcessor(0);
         }
-        jit.ClearCache();
         arm_step(&machine->cpu);
         cb.ticks_executed++;
     } else if (cb.exception_taken) {
@@ -550,7 +549,6 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
         machine->cpu.cpsr = jit.Cpsr();
         for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
         machine->cpu.vfp_fpscr = jit.Fpscr();
-        jit.ClearCache();
         arm_step(&machine->cpu);
         cb.ticks_executed++;
     } else {
