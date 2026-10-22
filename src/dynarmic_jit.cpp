@@ -69,7 +69,7 @@ public:
             // TPIDRURW: Read-write thread ID
             return &machine->cpu.cp15.tpidrurw;
         } else if (n == 7) {
-            if (m == 5) {
+            if (m == 5 && (opc2 == 0 || opc2 == 1)) {
                 // Instruction cache invalidate: clear JIT translation cache
                 return Callback{&InvalidateCacheCallback, jit};
             }
@@ -181,6 +181,19 @@ public:
     void MemoryWrite32(Dynarmic::A32::VAddr vaddr, std::uint32_t value) override { WriteMemory<uint32_t>(vaddr, value); }
     void MemoryWrite64(Dynarmic::A32::VAddr vaddr, std::uint64_t value) override { WriteMemory<uint64_t>(vaddr, value); }
 
+    bool MemoryWriteExclusive8(Dynarmic::A32::VAddr vaddr, std::uint8_t value, std::uint8_t expected) override {
+        return WriteMemoryExclusive<uint8_t>(vaddr, value, expected);
+    }
+    bool MemoryWriteExclusive16(Dynarmic::A32::VAddr vaddr, std::uint16_t value, std::uint16_t expected) override {
+        return WriteMemoryExclusive<uint16_t>(vaddr, value, expected);
+    }
+    bool MemoryWriteExclusive32(Dynarmic::A32::VAddr vaddr, std::uint32_t value, std::uint32_t expected) override {
+        return WriteMemoryExclusive<uint32_t>(vaddr, value, expected);
+    }
+    bool MemoryWriteExclusive64(Dynarmic::A32::VAddr vaddr, std::uint64_t value, std::uint64_t expected) override {
+        return WriteMemoryExclusive<uint64_t>(vaddr, value, expected);
+    }
+
     void InterpreterFallback(Dynarmic::A32::VAddr pc, size_t num_instructions) override {
         auto& regs = jit->Regs();
         for (int i = 0; i < 16; ++i) machine->cpu.r[i] = regs[i];
@@ -240,6 +253,7 @@ public:
         ticks_executed += ticks;
         if (ticks >= ticks_remaining) {
             ticks_remaining = 0;
+            jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
         } else {
             ticks_remaining -= ticks;
         }
@@ -321,6 +335,51 @@ private:
             jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
         }
         return val;
+    }
+
+    template <typename T>
+    bool WriteMemoryExclusive(Dynarmic::A32::VAddr vaddr, T val, T /*expected*/) {
+        bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
+
+        if constexpr (sizeof(T) > 1) {
+            if (((vaddr & 0xfffu) + sizeof(T)) > 0x1000u) {
+                return false;
+            }
+        }
+
+        uint32_t pa = 0;
+        uint32_t fsr = arm_mmu_translate(&machine->cpu, vaddr, ARM_ACCESS_WRITE, priv, &pa);
+        if (fsr != 0) {
+            abort_taken = true;
+            abort_fsr = fsr;
+            abort_far = vaddr;
+            jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+            return false;
+        }
+
+        if (pa >= machine->ram_base && pa + sizeof(T) <= machine->ram_base + machine->ram_size) {
+            std::memcpy(&machine->ram[pa - machine->ram_base], &val, sizeof(T));
+            if (machine->ram_watch) {
+                s5l8900_ram_changed(machine, pa, sizeof(T));
+            }
+            return true;
+        }
+
+        if (machine->cpu.bus) {
+            if constexpr (sizeof(T) == 1) {
+                machine->cpu.bus->write8(machine->cpu.bus->ctx, pa, static_cast<uint8_t>(val));
+            } else if constexpr (sizeof(T) == 2) {
+                machine->cpu.bus->write16(machine->cpu.bus->ctx, pa, static_cast<uint16_t>(val));
+            } else if constexpr (sizeof(T) == 4) {
+                machine->cpu.bus->write32(machine->cpu.bus->ctx, pa, static_cast<uint32_t>(val));
+            } else if constexpr (sizeof(T) == 8) {
+                machine->cpu.bus->write32(machine->cpu.bus->ctx, pa, static_cast<uint32_t>(val));
+                machine->cpu.bus->write32(machine->cpu.bus->ctx, pa + 4, static_cast<uint32_t>(val >> 32));
+            }
+            return true;
+        }
+
+        return false;
     }
 
     template <typename T>
@@ -496,7 +555,13 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
                   Dynarmic::HaltReason::MemoryAbort |
                   Dynarmic::HaltReason::CacheInvalidation);
 
+    if (!machine->cpu.excl_valid && jit_wrapper->monitor) {
+        jit_wrapper->monitor->ClearProcessor(0);
+    }
+
     jit.Run();
+
+    machine->cpu.excl_valid = false;
 
     if (cb.svc_taken) {
         cb.svc_taken = false;

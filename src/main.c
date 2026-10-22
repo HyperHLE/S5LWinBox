@@ -100,7 +100,7 @@ int main(int argc, char *argv[])
     char root_dir[512];
     get_default_data_dir(root_dir, sizeof root_dir);
     char explicit_machine[64] = {0};
-    bool enable_jit = false;
+    bool enable_jit = true;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) {

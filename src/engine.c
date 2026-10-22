@@ -2931,8 +2931,11 @@ engine_t *engine_create(const char *root_directory)
     mkdir_p(e->machines);
     const char *jit_env = getenv("S5L_ENABLE_JIT");
     const char *no_jit_env = getenv("S5L_DISABLE_JIT");
-    bool enable_jit = (jit_env && (strcmp(jit_env, "1") == 0 || strcmp(jit_env, "true") == 0));
+    bool enable_jit = true;
     if (no_jit_env && (strcmp(no_jit_env, "1") == 0 || strcmp(no_jit_env, "true") == 0)) {
+        enable_jit = false;
+    }
+    if (jit_env && (strcmp(jit_env, "0") == 0 || strcmp(jit_env, "false") == 0)) {
         enable_jit = false;
     }
     e->disable_jit = !enable_jit;
