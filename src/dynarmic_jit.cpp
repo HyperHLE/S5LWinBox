@@ -17,6 +17,8 @@
 
 class DynarmicCP15 final : public Dynarmic::A32::Coprocessor {
 public:
+    using CoprocReg = Dynarmic::A32::CoprocReg;
+
     s5l8900_t* machine = nullptr;
     Dynarmic::A32::Jit* jit = nullptr;
     uint32_t dummy_sink = 0;
@@ -33,6 +35,7 @@ public:
         auto* jit_instance = static_cast<Dynarmic::A32::Jit*>(arg);
         if (jit_instance) {
             jit_instance->ClearCache();
+            jit_instance->HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
         }
         return 0;
     }
@@ -161,6 +164,7 @@ public:
     void InstructionSynchronizationBarrierRaised() override {
         if (jit) {
             jit->ClearCache();
+            jit->HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
         }
     }
 
