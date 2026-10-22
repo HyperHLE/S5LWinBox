@@ -1720,11 +1720,12 @@ int engine_get_or_create_default_machine(engine_t *engine, char *out_id, size_t 
         /* Prefer an instance that has an existing provisioned rootfs-work.img */
         int best_idx = -1;
         for (unsigned i = 0; i < e->instances.count; i++) {
+            char mdir[ENGINE_PATH_CAP];
             char img_path[ENGINE_PATH_CAP];
             struct stat st;
-            if (join_path(img_path, sizeof img_path, e->machines, e->instances.slot[i].id) &&
-                join_path(img_path, sizeof img_path, img_path, "rootfs-work.img") &&
-                stat(img_path, &st) == 0 && st.st_size > 1000000) {
+            if (join_path(mdir, sizeof mdir, e->machines, e->instances.slot[i].id) &&
+                join_path(img_path, sizeof img_path, mdir, "rootfs-work.img") &&
+                stat(img_path, &st) == 0 && (uint64_t)st.st_size >= 1000000000ULL) {
                 best_idx = (int)i;
                 break;
             }
