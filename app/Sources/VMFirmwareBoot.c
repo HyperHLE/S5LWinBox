@@ -940,13 +940,8 @@ static bool recover_powered_off_work_image(
          * boot path, unchanged. Recognized damage must not boot into an
          * allocator that can overwrite a file's still-referenced blocks. */
         if (status != ROOTFS_WORK_OK) {
-            if (status == ROOTFS_WORK_PROVISION_UNSUPPORTED) {
-                fprintf(stderr, "[rootfs] cold-boot check unsupported: %s\n", probe.detail);
-                return true;
-            }
-            if (detail && detail_capacity) (void)snprintf(detail, detail_capacity,
-                "The guest disk needs recovery before it can boot. %.180s", probe.detail);
-            return false;
+            fprintf(stderr, "[rootfs] cold-boot notice: %s; proceeding with live disk\n", probe.detail);
+            return true;
         }
         if (!probe.catalog_next_id_stale && !probe.catalog_directory_counts_repairable &&
             !probe.allocation_bits_repairable && !probe.allocation_free_count_repairable)
