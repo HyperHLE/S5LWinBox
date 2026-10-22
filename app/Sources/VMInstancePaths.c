@@ -72,8 +72,12 @@ static bool copy_into(char *out, size_t capacity, const char *text) {
 static uint64_t regular_file_size(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0u;
-    long size = 0;
-    if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    int64_t size = 0;
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) == 0) size = _ftelli64(f);
+#else
+    if (fseek(f, 0, SEEK_END) == 0) size = (int64_t)ftell(f);
+#endif
     fclose(f);
     return size > 0 ? (uint64_t)size : 0u;
 }
