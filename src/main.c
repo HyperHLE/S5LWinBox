@@ -100,15 +100,17 @@ int main(int argc, char *argv[])
     char root_dir[512];
     get_default_data_dir(root_dir, sizeof root_dir);
     char explicit_machine[64] = {0};
-    bool no_jit = false;
+    bool enable_jit = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) {
             snprintf(root_dir, sizeof root_dir, "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--machine") && i + 1 < argc) {
             snprintf(explicit_machine, sizeof explicit_machine, "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--jit")) {
+            enable_jit = true;
         } else if (!strcmp(argv[i], "--no-jit")) {
-            no_jit = true;
+            enable_jit = false;
         }
     }
 
@@ -130,9 +132,7 @@ int main(int argc, char *argv[])
         SDL_Quit();
         return 1;
     }
-    if (no_jit) {
-        engine_set_jit_enabled(g_engine, false);
-    }
+    engine_set_jit_enabled(g_engine, enable_jit);
     web_log_server_set_engine(g_engine);
 
     /* Start Web Inspector log server */
@@ -222,7 +222,8 @@ int main(int argc, char *argv[])
     bool fw_ready = (strstr(fw_json, "\"ok\":true") != NULL);
     if (fw_ready) {
         printf("\n=== iPhone OS 3.1.3 firmware found; guest startup has begun. ===\n");
-        printf("Controls: Mouse/Click = Touchscreen, Esc = Home, F1 = Power, F2/F3 = Vol -/+, F5 = Mute, F11 = Fullscreen, Space = Pause\n\n");
+        printf("Controls: Mouse/Click = Touchscreen, Esc = Home, F1 = Power, F2/F3 = Vol -/+, F5 = Mute, F11 = Fullscreen, Space = Pause\n");
+        printf("Options: --machine [id], --data [path], --jit (experimental Dynarmic A32 JIT), --no-jit\n\n");
     } else {
         printf("\n>>> Drag and drop an iPhone OS 3.1.3 IPSW file into this window to install firmware! <<<\n");
         printf("Hotkeys: Esc=Home, F1=Power, F2/F3=Vol-/+, F5=Mute, F11=Fullscreen, Space=Pause\n\n");

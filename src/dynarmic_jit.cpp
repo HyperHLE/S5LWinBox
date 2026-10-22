@@ -533,15 +533,16 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
     } else if (cb.abort_taken) {
         cb.abort_taken = false;
         for (int i = 0; i < 15; ++i) machine->cpu.r[i] = regs[i];
+        machine->cpu.r[15] = regs[15];
         machine->cpu.cpsr = jit.Cpsr();
         for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
         machine->cpu.vfp_fpscr = jit.Fpscr();
         if (jit_wrapper->monitor) {
             jit_wrapper->monitor->ClearProcessor(0);
         }
-
-        uint32_t fault_pc = regs[15];
-        arm_take_data_abort_ex(&machine->cpu, fault_pc, cb.abort_far, cb.abort_fsr);
+        jit.ClearCache();
+        arm_step(&machine->cpu);
+        cb.ticks_executed++;
     } else if (cb.exception_taken) {
         cb.exception_taken = false;
         for (int i = 0; i < 15; ++i) machine->cpu.r[i] = regs[i];
@@ -550,6 +551,8 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
         for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
         machine->cpu.vfp_fpscr = jit.Fpscr();
         jit.ClearCache();
+        arm_step(&machine->cpu);
+        cb.ticks_executed++;
     } else {
         for (int i = 0; i < 16; ++i) machine->cpu.r[i] = regs[i];
         machine->cpu.cpsr = jit.Cpsr();

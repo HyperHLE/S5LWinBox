@@ -2605,7 +2605,7 @@ static void engine_thread_main(engine_t *e)
             console_append(e, "[jit] Dynarmic JIT initialization failed; using interpreter\n");
         }
     } else {
-        console_append(e, "[jit] Dynarmic JIT disabled; using interpreter\n");
+        console_append(e, "[jit] Interpreter mode active (native high-speed ARMv6 core)\n");
     }
 #endif
 
@@ -2928,8 +2928,13 @@ engine_t *engine_create(const char *root_directory)
     mkdir_p(e->root);
     mkdir_p(e->firmware);
     mkdir_p(e->machines);
+    const char *jit_env = getenv("S5L_ENABLE_JIT");
     const char *no_jit_env = getenv("S5L_DISABLE_JIT");
-    e->disable_jit = (no_jit_env && (strcmp(no_jit_env, "1") == 0 || strcmp(no_jit_env, "true") == 0));
+    bool enable_jit = (jit_env && (strcmp(jit_env, "1") == 0 || strcmp(jit_env, "true") == 0));
+    if (no_jit_env && (strcmp(no_jit_env, "1") == 0 || strcmp(no_jit_env, "true") == 0)) {
+        enable_jit = false;
+    }
+    e->disable_jit = !enable_jit;
     load_instances(e);
     e->phase = PHASE_IDLE;
     snprintf(e->status, sizeof e->status, "idle");

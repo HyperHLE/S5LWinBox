@@ -813,9 +813,10 @@ static void handle_client_request(socket_t fd, int slot)
         char body[256];
         pthread_mutex_lock(&s_lock);
         int body_len = snprintf(body, sizeof body,
-            "{\"retired\":%llu,\"fps\":%.2f,\"mips\":%.2f,\"ttbr0\":\"0x%08x\",\"state\":\"%s\"}",
+            "{\"retired\":%llu,\"fps\":%.2f,\"mips\":%.2f,\"ttbr0\":\"0x%08x\",\"state\":\"%s\",\"jit\":%s}",
             (unsigned long long)s_status_retired, s_status_fps, s_status_mips,
-            s_status_ttbr0, s_status_state);
+            s_status_ttbr0, s_status_state,
+            (s_engine && engine_is_jit_enabled(s_engine)) ? "true" : "false");
         pthread_mutex_unlock(&s_lock);
 
         char header[256];
