@@ -673,10 +673,14 @@ vm_firmware_checkpoint_status_t vm_firmware_boot_save_resume_cancellable(
     return VM_FW_CHECKPOINT_OK;
 }
 
+void vm_firmware_boot_detach_network(vm_firmware_boot_t *boot) {
+    if (boot) vm_network_session_destroy(&boot->network);
+}
+
 void vm_firmware_boot_destroy(vm_firmware_boot_t **slot) {
     if (!slot || !*slot) return;
     vm_firmware_boot_t *boot = *slot;
-    vm_network_session_destroy(&boot->network);
+    vm_firmware_boot_detach_network(boot);
 #if defined(S5LBOX_IOS3_HLE_EXPERIMENT)
     if (boot->hle_machine)
         vm_firmware_hle_release(boot->hle_machine);

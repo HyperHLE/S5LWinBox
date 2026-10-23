@@ -2830,6 +2830,7 @@ static void engine_thread_main(engine_t *e)
     s5l8900_set_user_observers(machine, NULL, NULL, NULL);
     term_hyperhle_gles();
     web_log_flush_raw();
+    vm_firmware_boot_detach_network(boot);
     s5l8900_free(machine);
     free(machine);
     vm_firmware_boot_destroy(&boot);
@@ -2976,9 +2977,10 @@ void engine_destroy(engine_t *engine)
         e->join_pending = false;
     }
 
+    web_log_server_stop();
+    web_log_server_set_engine(NULL);
     free(e->snapshot);
     pthread_mutex_destroy(&e->lock);
-    web_log_server_stop();
     free(e);
 }
 

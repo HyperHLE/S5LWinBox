@@ -1743,6 +1743,12 @@ void s5l8900_free(s5l8900_t *m) {
     s5l_nor_free(&m->nor);
 }
 
+static void machine_invalidate_code_cache(void *ctx) {
+    s5l8900_t *m = ctx;
+    if (m->jit && m->jit_ops && m->jit_ops->clear_cache)
+        m->jit_ops->clear_cache(m->jit);
+}
+
 void s5l8900_set_jit(s5l8900_t *m, void *jit, const s5l_jit_ops_t *ops) {
     if (!m) return;
     if (m->jit && m->jit_ops && m->jit_ops->destroy && m->jit != jit) {
@@ -1750,6 +1756,7 @@ void s5l8900_set_jit(s5l8900_t *m, void *jit, const s5l_jit_ops_t *ops) {
     }
     m->jit = jit;
     m->jit_ops = ops;
+    m->bus.invalidate_code_cache = machine_invalidate_code_cache;
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
@@ -2970,7 +2977,9 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
             if (batch > 20000u) batch = 20000u;
 
             uint32_t retired = m->jit_ops->run(m->jit, batch);
-            if (retired > 0 || (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) {
+            if (m->jit_ops->status) st = m->jit_ops->status(m->jit);
+            if (retired > 0 || st != ARM_OK ||
+                (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) {
                 n += retired;
                 m->jit_retired += retired;
                 run_clock_retired(m, &active_clock,

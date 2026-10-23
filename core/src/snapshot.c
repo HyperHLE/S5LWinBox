@@ -242,7 +242,9 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * 258664 adds the JIT backend handle, operations table and retired-instruction
  * counter (24). They are host-only and absent from snap_mach(), so the on-disk
  * format and SNAPSHOT_VERSION remain unchanged. */
-SNAP_SIZE_GUARD(s5l8900_t,         258664, "snap_mach");
+/* 258672 adds the host-only CP15 instruction-cache maintenance callback.
+ * It remains live in arm_bus_t on restore and adds no serialized bytes. */
+SNAP_SIZE_GUARD(s5l8900_t,         258672, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */

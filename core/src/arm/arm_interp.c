@@ -872,7 +872,12 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
             case 3:  p->dacr = v; arm_mmu_tlb_flush(c); break;
             case 5:  if (opc2 == 1) p->ifsr = v; else p->dfsr = v; break;
             case 6:  if (opc2 == 2) p->ifar = v; else p->dfar = v; break;
-            case 7:  break;                     /* cache maintenance: no-op */
+            case 7:
+                if (opc1 == 0u && ((crm == 5u && (opc2 == 0u || opc2 == 1u)) ||
+                                  (crm == 7u && opc2 == 0u)) &&
+                    c->bus && c->bus->invalidate_code_cache)
+                    c->bus->invalidate_code_cache(c->bus->ctx);
+                break;
             /*
              * TLB maintenance. This was a documented no-op for as long as
              * there was no TLB to maintain; now it is the architecture's own

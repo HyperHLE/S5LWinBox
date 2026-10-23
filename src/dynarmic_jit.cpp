@@ -5,6 +5,10 @@
  */
 
 #include "dynarmic_jit.h"
+extern "C" {
+#include "vfp.h"
+}
+#include <dynarmic/frontend/A32/a32_ir_emitter.h>
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/A32/config.h>
 #include <dynarmic/interface/A32/coprocessor.h>
@@ -109,7 +113,9 @@ public:
     Dynarmic::A32::Jit* jit = nullptr;
     uint64_t ticks_remaining = 0;
     uint64_t ticks_executed = 0;
-
+    uint64_t interpreted_ticks = 0;
+    uint64_t failed_ticks = 0;
+    arm_status_t status = ARM_OK;
     bool svc_taken = false;
     uint32_t svc_swi = 0;
     bool exception_taken = false;
@@ -157,7 +163,74 @@ public:
         return std::nullopt;
     }
 
-    bool PreCodeReadHook(bool /*is_thumb*/, Dynarmic::A32::VAddr /*pc*/, Dynarmic::A32::IREmitter& /*ir*/) override {
+    bool PreCodeReadHook(bool is_thumb, Dynarmic::A32::VAddr pc, Dynarmic::A32::IREmitter& ir) override {
+        // A branch inside a compiled run must still return to the machine's
+        // HLE gate before executing the instruction at a replacement site.
+        if (s5l8900_pre_step_target(machine, pc)) {
+            ir.UpdateUpperLocationDescriptor();
+            ir.BranchWritePC(ir.Imm32(pc));
+            ir.ExceptionRaised(Dynarmic::A32::Exception::Yield);
+            ir.SetTerm(Dynarmic::IR::Term::CheckHalt{Dynarmic::IR::Term::ReturnToDispatch{}});
+            return false;
+        }
+
+        const auto code = MemoryReadCode(pc & ~3u);
+        if (!code) return true;
+        bool interpret = false;
+        bool memory = false;
+        if (is_thumb) {
+            const uint16_t insn = static_cast<uint16_t>(*code >> ((pc & 2u) * 8u));
+            // PUSH/POP and LDM/STM need the ARM1176 base-restored abort model.
+            interpret = (insn & 0xf000u) == 0xc000u ||
+                        (insn & 0xf600u) == 0xb400u;
+            memory = (insn & 0xf800u) == 0x4800u ||
+                     (insn & 0xf000u) == 0x5000u ||
+                     (insn & 0xe000u) == 0x6000u ||
+                     (insn & 0xf000u) == 0x8000u ||
+                     (insn & 0xf000u) == 0x9000u;
+        } else {
+            const uint32_t insn = *code;
+            const bool vfp = (insn & 0xfe000000u) == 0xf2000000u ||
+                (insn & 0x0f000e10u) == 0x0e000a00u ||
+                (insn & 0x0e000e00u) == 0x0c000a00u ||
+                (insn & 0xff100000u) == 0xf4000000u ||
+                (insn & 0x0f000e10u) == 0x0e000a10u ||
+                (insn & 0x0fe00e00u) == 0x0c400a00u;
+            const bool writeback = !(insn & (1u << 24)) || (insn & (1u << 21));
+            const bool single_transfer = (insn & 0x0c000000u) == 0x04000000u;
+            const bool extra_transfer = (insn & 0x0e000090u) == 0x00000090u &&
+                                        (insn & 0x60u) != 0;
+            const bool multi_transfer = (insn & 0x0e000000u) == 0x08000000u;
+            const bool vfp_memory = (insn & 0x0e000e00u) == 0x0c000a00u &&
+                                    (insn & 0x0fe00e00u) != 0x0c400a00u;
+            const bool double_transfer = extra_transfer && !(insn & (1u << 20)) &&
+                                         (insn & 0x40u);
+            const bool store_pc = single_transfer && !(insn & (1u << 20)) &&
+                                  ((insn >> 12) & 15u) == 15u;
+            // Match the interpreter's staging of VFPv2 vector sources when
+            // source and destination register banks overlap.
+            const bool vfp_vector = (insn & 0x0f000e10u) == 0x0e000a00u &&
+                                   (ir.current_location.FPSCR().Value() & (7u << 16));
+            const bool cps = (insn & 0xfff1fe20u) == 0xf1000000u;
+            memory = single_transfer || extra_transfer ||
+                     (insn & 0x0f000090u) == 0x01000090u;
+            interpret = multi_transfer || vfp_memory || double_transfer || store_pc || vfp_vector || cps ||
+                (extra_transfer && !(machine->cpu.cp15.sctlr & (ARM_SCTLR_A | ARM_SCTLR_U))) ||
+                (writeback && (single_transfer || extra_transfer)) ||
+                (vfp && (!vfp_cpacr_permits(&machine->cpu) || !vfp_enabled(&machine->cpu)));
+        }
+        if (interpret) {
+            // Dynarmic commits some writebacks before checking MemoryAbort.
+            // Let arm_step own these transfers and lazy VFP exception entry.
+            ir.SetTerm(Dynarmic::IR::Term::Interpret{ir.current_location});
+            return false;
+        }
+        if (memory && ir.block.CycleCount() != 0) {
+            // Dynarmic's memory-abort exit bypasses the current block's cycle
+            // charge. Retire its prefix before entering a faultable instruction.
+            ir.SetTerm(Dynarmic::IR::Term::LinkBlock{ir.current_location});
+            return false;
+        }
         return true;
     }
 
@@ -206,7 +279,11 @@ public:
 
         for (size_t i = 0; i < num_instructions; ++i) {
             arm_status_t st = arm_step(&machine->cpu);
+            status = st;
+            if (st != ARM_OK) ++failed_ticks;
             ticks_executed++;
+            interpreted_ticks++;
+            if (ticks_remaining) --ticks_remaining;
             if (st != ARM_OK || (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) {
                 for (int j = 0; j < 16; ++j) regs[j] = machine->cpu.r[j];
                 jit->SetCpsr(machine->cpu.cpsr);
@@ -221,6 +298,9 @@ public:
         jit->SetCpsr(machine->cpu.cpsr);
         for (int i = 0; i < 32; ++i) ext[i] = machine->cpu.vfp_s[i];
         jit->SetFpscr(machine->cpu.vfp_fpscr);
+        // Rejoin the machine loop so interpreter retirements participate in
+        // the slice budget and pending device/interrupt checks.
+        jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
     }
 
     void CallSVC(std::uint32_t swi) override {
@@ -234,7 +314,6 @@ public:
         case Dynarmic::A32::Exception::WaitForInterrupt:
         case Dynarmic::A32::Exception::WaitForEvent:
         case Dynarmic::A32::Exception::Yield:
-            machine->wfi_pace_yield = true;
             jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
             break;
         case Dynarmic::A32::Exception::UndefinedInstruction:
@@ -272,6 +351,25 @@ public:
 private:
     template <typename T>
     T ReadMemory(Dynarmic::A32::VAddr vaddr) {
+        if constexpr (sizeof(T) == 2 || sizeof(T) == 4) {
+            if (vaddr & (sizeof(T) - 1)) {
+                if (machine->cpu.cp15.sctlr & ARM_SCTLR_A) {
+                    abort_taken = true;
+                    abort_far = vaddr;
+                    abort_fsr = ARM_FSR_ALIGNMENT;
+                    jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+                    return 0;
+                }
+                if (!(machine->cpu.cp15.sctlr & ARM_SCTLR_U)) {
+                    T value = ReadMemory<T>(vaddr & ~uint32_t(sizeof(T) - 1));
+                    if constexpr (sizeof(T) == 4) {
+                        const unsigned shift = (vaddr & 3u) * 8u;
+                        value = (value >> shift) | (value << (32u - shift));
+                    }
+                    return value;
+                }
+            }
+        }
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
 
         if constexpr (sizeof(T) > 1) {
@@ -338,7 +436,7 @@ private:
     }
 
     template <typename T>
-    bool WriteMemoryExclusive(Dynarmic::A32::VAddr vaddr, T val, T /*expected*/) {
+    bool WriteMemoryExclusive(Dynarmic::A32::VAddr vaddr, T val, T expected) {
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
 
         if constexpr (sizeof(T) > 1) {
@@ -358,10 +456,13 @@ private:
         }
 
         if (pa >= machine->ram_base && pa + sizeof(T) <= machine->ram_base + machine->ram_size) {
-            std::memcpy(&machine->ram[pa - machine->ram_base], &val, sizeof(T));
+            T current{};
+            std::memcpy(&current, &machine->ram[pa - machine->ram_base], sizeof(T));
+            if (current != expected) return false;
             if (machine->ram_watch) {
                 s5l8900_ram_changed(machine, pa, sizeof(T));
             }
+            std::memcpy(&machine->ram[pa - machine->ram_base], &val, sizeof(T));
             return true;
         }
 
@@ -384,6 +485,21 @@ private:
 
     template <typename T>
     void WriteMemory(Dynarmic::A32::VAddr vaddr, T val) {
+        if constexpr (sizeof(T) == 2 || sizeof(T) == 4) {
+            if (vaddr & (sizeof(T) - 1)) {
+                if (machine->cpu.cp15.sctlr & ARM_SCTLR_A) {
+                    abort_taken = true;
+                    abort_far = vaddr;
+                    abort_fsr = ARM_FSR_ALIGNMENT | (1u << 11);
+                    jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
+                    return;
+                }
+                if (!(machine->cpu.cp15.sctlr & ARM_SCTLR_U)) {
+                    WriteMemory<T>(vaddr & ~uint32_t(sizeof(T) - 1), val);
+                    return;
+                }
+            }
+        }
         bool priv = (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
 
         if constexpr (sizeof(T) > 1) {
@@ -459,6 +575,12 @@ struct dynarmic_jit {
     uint32_t last_ttbr0 = 0;
     uint32_t last_context_id = 0;
     uint64_t last_tlb_flushes = 0;
+    uint32_t last_cpacr = 0;
+    uint32_t last_fpexc = 0;
+    uint64_t last_cycles = 0;
+    bool previous_slice_user = false;
+    unsigned last_hook_count = 0;
+    uint32_t last_hook_targets[S5L_PRE_STEP_TARGET_MAX]{};
 };
 
 extern "C" dynarmic_jit_t *dynarmic_jit_create(s5l8900_t *machine) {
@@ -516,7 +638,7 @@ extern "C" void dynarmic_jit_invalidate_range(dynarmic_jit_t *jit, uint32_t star
 }
 
 extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_ticks) {
-    if (!jit_wrapper || !jit_wrapper->jit || !jit_wrapper->machine) return 0;
+    if (!jit_wrapper || !jit_wrapper->jit || !jit_wrapper->machine || !max_ticks) return 0;
 
     s5l8900_t* machine = jit_wrapper->machine;
     auto& jit = *jit_wrapper->jit;
@@ -524,11 +646,21 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
 
     if (machine->cpu.cp15.ttbr0 != jit_wrapper->last_ttbr0 ||
         machine->cpu.cp15.context_id != jit_wrapper->last_context_id ||
-        machine->cpu.tlb_flushes != jit_wrapper->last_tlb_flushes) {
+        machine->cpu.tlb_flushes != jit_wrapper->last_tlb_flushes ||
+        machine->cpu.cp15.cpacr != jit_wrapper->last_cpacr ||
+        machine->cpu.vfp_fpexc != jit_wrapper->last_fpexc ||
+        machine->pre_step_target_count != jit_wrapper->last_hook_count ||
+        std::memcmp(machine->pre_step_target, jit_wrapper->last_hook_targets,
+                    sizeof jit_wrapper->last_hook_targets) != 0) {
         jit.ClearCache();
         jit_wrapper->last_ttbr0 = machine->cpu.cp15.ttbr0;
         jit_wrapper->last_context_id = machine->cpu.cp15.context_id;
         jit_wrapper->last_tlb_flushes = machine->cpu.tlb_flushes;
+        jit_wrapper->last_cpacr = machine->cpu.cp15.cpacr;
+        jit_wrapper->last_fpexc = machine->cpu.vfp_fpexc;
+        jit_wrapper->last_hook_count = machine->pre_step_target_count;
+        std::memcpy(jit_wrapper->last_hook_targets, machine->pre_step_target,
+                    sizeof jit_wrapper->last_hook_targets);
     }
 
     auto& regs = jit.Regs();
@@ -540,6 +672,9 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
 
     cb.ticks_remaining = max_ticks;
     cb.ticks_executed = 0;
+    cb.interpreted_ticks = 0;
+    cb.failed_ticks = 0;
+    cb.status = ARM_OK;
     cb.svc_taken = false;
     cb.svc_swi = 0;
     cb.exception_taken = false;
@@ -552,10 +687,16 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
                   Dynarmic::HaltReason::UserDefined2 |
                   Dynarmic::HaltReason::UserDefined3 |
                   Dynarmic::HaltReason::Step |
-                  Dynarmic::HaltReason::MemoryAbort |
-                  Dynarmic::HaltReason::CacheInvalidation);
+                  Dynarmic::HaltReason::MemoryAbort);
+    // ClearCache/InvalidateCacheRange queue work behind CacheInvalidation.
+    // Run owns that flag; clearing it here would keep stale translations alive.
 
-    if (!machine->cpu.excl_valid && jit_wrapper->monitor) {
+    // A host slice boundary does not clear an ARM exclusive reservation.
+    // Interpreter/kernel work between native slices does: exception entry in
+    // arm_step clears its own monitor, and advances the architectural clock.
+    if ((!jit_wrapper->previous_slice_user || machine->cpu.cycles != jit_wrapper->last_cycles) &&
+        jit_wrapper->monitor) {
+        jit.ClearExclusiveState();
         jit_wrapper->monitor->ClearProcessor(0);
     }
 
@@ -605,7 +746,7 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
         if (jit_wrapper->monitor) {
             jit_wrapper->monitor->ClearProcessor(0);
         }
-        arm_step(&machine->cpu);
+        arm_take_data_abort_ex(&machine->cpu, regs[15], cb.abort_far, cb.abort_fsr);
         cb.ticks_executed++;
     } else if (cb.exception_taken) {
         cb.exception_taken = false;
@@ -614,8 +755,9 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
         machine->cpu.cpsr = jit.Cpsr();
         for (int i = 0; i < 32; ++i) machine->cpu.vfp_s[i] = ext[i];
         machine->cpu.vfp_fpscr = jit.Fpscr();
-        arm_step(&machine->cpu);
-        cb.ticks_executed++;
+        cb.status = arm_step(&machine->cpu);
+        if (cb.status != ARM_OK) ++cb.failed_ticks;
+        cb.interpreted_ticks++;
     } else {
         for (int i = 0; i < 16; ++i) machine->cpu.r[i] = regs[i];
         machine->cpu.cpsr = jit.Cpsr();
@@ -623,8 +765,11 @@ extern "C" uint32_t dynarmic_jit_run(dynarmic_jit_t *jit_wrapper, uint32_t max_t
         machine->cpu.vfp_fpscr = jit.Fpscr();
     }
 
-    machine->cpu.cycles += cb.ticks_executed;
-    return static_cast<uint32_t>(cb.ticks_executed);
+    machine->cpu.cycles += cb.ticks_executed - cb.interpreted_ticks;
+    jit_wrapper->last_cycles = machine->cpu.cycles;
+    jit_wrapper->previous_slice_user =
+        (machine->cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR;
+    return static_cast<uint32_t>(cb.ticks_executed - cb.failed_ticks);
 }
 
 static uint32_t shim_run(void *jit, uint32_t max_ticks) {
@@ -639,8 +784,13 @@ static void shim_destroy(void *jit) {
     dynarmic_jit_destroy(static_cast<dynarmic_jit_t*>(jit));
 }
 
+static arm_status_t shim_status(void *jit) {
+    return static_cast<dynarmic_jit_t*>(jit)->callbacks->status;
+}
+
 extern "C" const s5l_jit_ops_t g_dynarmic_jit_ops = {
     shim_run,
     shim_clear_cache,
     shim_destroy,
+    shim_status,
 };

@@ -254,7 +254,8 @@ typedef struct {
 /*
  * Opaque owner of the open work image and the ~300 KiB of bridge storage the
  * memory-disk bridges need. It must stay alive for exactly as long as the
- * machine does, and be destroyed AFTER s5l8900_free().
+ * machine does, and be destroyed AFTER s5l8900_free(). Detach its networking
+ * callbacks with vm_firmware_boot_detach_network() before freeing the machine.
  */
 typedef struct vm_firmware_boot vm_firmware_boot_t;
 
@@ -373,6 +374,8 @@ bool vm_firmware_boot_network_status(const vm_firmware_boot_t *boot,
 uint64_t vm_firmware_boot_restart_count(const vm_firmware_boot_t *boot);
 
 void vm_firmware_boot_destroy(vm_firmware_boot_t **boot);
+/* Ends network callbacks while their machine and packet bridge are still alive. */
+void vm_firmware_boot_detach_network(vm_firmware_boot_t *boot);
 
 /*
  * Make this machine's writable work image from the shared imported rootfs.img:

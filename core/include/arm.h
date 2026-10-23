@@ -324,6 +324,7 @@ typedef struct arm_bus {
     void *user_svc_ctx;
     void (*user_fault_observer)(void *ctx, struct arm_cpu *cpu, uint32_t vector, uint32_t far, uint32_t fsr);
     void *user_fault_ctx;
+    void (*invalidate_code_cache)(void *ctx); /* optional CP15 I-cache maintenance */
 } arm_bus_t;
 
 /*

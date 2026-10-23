@@ -18,6 +18,7 @@ if(POLICY CMP0167)
 endif()
 
 include(FetchContent)
+include(CTest)
 FetchContent_Declare(
     boost
     GIT_REPOSITORY https://github.com/Vita3K/ext-boost.git
@@ -63,6 +64,19 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(dynarmic)
+include(cmake/DynarmicHostFpu.cmake)
+s5l_patch_dynarmic_host_fpu("${dynarmic_SOURCE_DIR}")
+
+add_library(s5l_dynarmic_jit STATIC src/dynarmic_jit.cpp)
+target_include_directories(s5l_dynarmic_jit PUBLIC core/include)
+target_include_directories(s5l_dynarmic_jit SYSTEM PRIVATE "${Boost_INCLUDE_DIR}")
+target_link_libraries(s5l_dynarmic_jit PUBLIC dynarmic emucore PRIVATE mcl fmt::fmt)
+
+if(BUILD_TESTING)
+    add_executable(test_dynarmic_jit core/tests/test_dynarmic_jit.cpp)
+    target_link_libraries(test_dynarmic_jit PRIVATE s5l_dynarmic_jit)
+    add_test(NAME dynarmic_integration COMMAND test_dynarmic_jit)
+endif()
 
 # Determine SDL2 target name
 if(TARGET SDL2::SDL2)
@@ -83,7 +97,6 @@ add_executable(s5lwinbox
     src/engine.c
     src/engine_ipa.c
     src/web_log_server.c
-    src/dynarmic_jit.cpp
     ${S5L_APP_SOURCES}
 )
 
@@ -117,7 +130,7 @@ endif()
 
 target_link_libraries(s5lwinbox PRIVATE
     ${S5L_SDL_TARGET}
-    dynarmic
+    s5l_dynarmic_jit
     emucore
     nethost
     host_file_block

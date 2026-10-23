@@ -121,6 +121,16 @@ bool vm_frame_telemetry_is_enabled(void) {
 }
 
 uint64_t vm_frame_telemetry_now_ns(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER counter, frequency;
+    if (!QueryPerformanceCounter(&counter) ||
+        !QueryPerformanceFrequency(&frequency) ||
+        counter.QuadPart < 0 || frequency.QuadPart <= 0) return 0;
+    uint64_t ticks = (uint64_t)counter.QuadPart;
+    uint64_t hz = (uint64_t)frequency.QuadPart;
+    return (ticks / hz) * UINT64_C(1000000000) +
+           (ticks % hz) * UINT64_C(1000000000) / hz;
+#else
     struct timespec now;
 #if defined(CLOCK_MONOTONIC)
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
@@ -133,6 +143,7 @@ uint64_t vm_frame_telemetry_now_ns(void) {
     uint64_t seconds = (uint64_t)now.tv_sec;
     if (seconds > UINT64_MAX / UINT64_C(1000000000)) return 0;
     return seconds * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+#endif
 }
 
 const char *vm_frame_scanout_reason_name(vm_frame_scanout_reason_t reason) {
